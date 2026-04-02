@@ -1,0 +1,61 @@
+.more-reasoning-container {
+    margin-bottom: 0.3rem;
+}
+
+.more-reasoning-details {
+    margin-bottom: 0.3rem;
+    border: 1px solid color-mix(in srgb, var(--borderColor), transparent 60%);
+    border-radius: 0.3rem;
+    padding: 0.125rem;
+    background: color-mix(in srgb, var(--bgColor), transparent 5%);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.more-reasoning-details:hover {
+    border-color: var(--borderColor);
+    box-shadow: 0 2px 4px color-mix(in srgb, var(--accentColor), transparent 80%);
+}
+
+.more-reasoning-settings-container {
+    margin-top: 0.625rem;
+    padding: 0.625rem;
+    border: 1px solid var(--borderColor);
+    border-radius: 0.625rem;
+    background: color-mix(in srgb, var(--bgColor), transparent 10%);
+}
+
+.more-reasoning-parser-item {
+    padding: 0.625rem;
+    margin-bottom: 0.625rem;
+    border-bottom: 1px dotted var(--borderColor);
+    background: color-mix(in srgb, var(--bgColor), transparent 5%);
+    border-radius: 0.375rem;
+    transition: background 0.2s ease;
+}
+
+.more-reasoning-parser-item:hover {
+    background: color-mix(in srgb, var(--bgColor), transparent 0%);
+}
+
+.more-reasoning-parser-item:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+}
+
+.more-reasoning-actions {
+    display: flex;
+    gap: 0.3125rem;
+    align-items: center;
+}
+
+.more-reasoning-add-btn {
+    cursor: pointer;
+    margin-top: 0.3125rem;
+    transition: transform 0.15s ease, opacity 0.2s ease;
+    opacity: 0.8;
+}
+
+.more-reasoning-add-btn:hover {
+    opacity: 1;
+    transform: scale(1.1);
+}

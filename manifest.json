@@ -1,0 +1,13 @@
+{
+    "display_name": "SillyTavern-MoreReasoning",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "icefog72",
+    "version": "0.1.0",
+    "homePage": "https://github.com/IceFog72/SillyTavern-MoreReasoning",
+    "auto_update": true,
+    "description": ""
+}
