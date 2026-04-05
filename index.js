@@ -678,6 +678,34 @@ eventSource.on(event_types.APP_READY, () => {
     init();
 });
 
+async function checkAndParseMessage(messageId) {
+    const message = chat[messageId];
+    if (!message || message.is_user) return;
+    
+    // Skip if already parsed
+    if (message.extra?.reasoning_blocks?.length) return;
+
+    const hasCustomTags = settings.parsers.some(
+        p => p.enabled && p.prefix && p.suffix && message.mes.includes(p.prefix),
+    );
+
+    if (hasCustomTags) {
+        const handler = new ReasoningHandler();
+        handler._mr_isReparsing = true; // suppress TTS event spam
+        await handler.process(messageId, false);
+    }
+}
+
+// Catch messages from non-streamed inference and swipes
+eventSource.on(event_types.MESSAGE_RECEIVED, async (messageId) => {
+    await checkAndParseMessage(messageId);
+});
+
+// Catch tags added during message edits
+eventSource.on(event_types.MESSAGE_UPDATED, async (messageId) => {
+    await checkAndParseMessage(messageId);
+});
+
 // Bug #4: CHARACTER_MESSAGE_RENDERED for per-message DOM patching (hot path)
 eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => {
     const message = chat[messageId];
