@@ -646,10 +646,13 @@ function patchReasoning() {
             // 'mes_reasoning_details' for ST CSS styling,
             // 'more-reasoning-details' as our own class + :not() guard above
             details.className = 'mes_reasoning_details more-reasoning-details';
+            details.dataset.parserId = parser.id; // required for editing
             if (block.incomplete) details.dataset.state = 'thinking';
             if (parser.autoExpand || block.incomplete) details.open = true;
 
             const headerTitle = block.incomplete ? `${parser.name} (Thinking...)` : parser.name;
+
+            // Add custom reasoning actions with edit buttons
             details.innerHTML = `
                 <summary class="mes_reasoning_summary flex-container">
                     <div class="mes_reasoning_header_block flex-container">
@@ -657,9 +660,15 @@ function patchReasoning() {
                             <span class="mes_reasoning_header_title">${headerTitle}</span>
                             <div class="mes_reasoning_arrow fa-solid fa-chevron-up"></div>
                         </div>
+                        <div class="mes_reasoning_actions flex-direction-row flex-container mr_mes_reasoning_actions" style="margin-top: 5px;">
+                            <div class="mr_mes_reasoning_edit_done menu_button edit_button fa-solid fa-check" title="Confirm" style="display:none"></div>
+                            <div class="mr_mes_reasoning_edit_cancel menu_button edit_button fa-solid fa-xmark" title="Cancel edit" style="display:none"></div>
+                            <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
+                        </div>
                     </div>
                 </summary>
                 <div class="mes_reasoning">${messageFormatting(block.content, '', false, false, messageId, {}, true)}</div>
+
             `;
             multiContainer.appendChild(details);
         });
@@ -671,6 +680,104 @@ function patchReasoning() {
         }
     };
 
+    // Bug #8: Prevent ST's native edit button from spawning duplicate textareas above custom blocks.
+    // ST uses messageBlock.find('.mes_reasoning') which blindly matches our custom blocks.
+    // Because ST sometimes triggers this programmatically via $.trigger('click'), native capture doesn't work.
+    $(document).on('click', '.mes_reasoning_edit:not(.mr_mes_reasoning_edit)', function () {
+        const mes = $(this).closest('.mes');
+        if (!mes.length) return;
+        
+        // Remove textareas ST mistakenly injected into our extension's custom blocks
+        const errantTextareas = mes.find('.more-reasoning-details > .reasoning_edit_textarea:not(.mr_reasoning_edit_textarea)');
+        if (errantTextareas.length > 0) {
+            errantTextareas.remove();
+            
+            // ST might have given focus to the wrong textarea clone. Regain focus on the native one.
+            const nativeTextarea = mes.find('.reasoning_edit_textarea:not(.mr_reasoning_edit_textarea)').first();
+            if (nativeTextarea.length) {
+                nativeTextarea.focus();
+            }
+        }
+    });
+
+    // Custom block editing handlers
+    $(document).on('click', '.mr_mes_reasoning_edit', function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+
+        const details = $(this).closest('.more-reasoning-details');
+        const messageBlock = details.closest('.mes');
+        const messageId = messageBlock.attr('mesid');
+        const message = chat[messageId];
+        const parserId = details.attr('data-parser-id');
+
+        if (!message || !message.extra?.reasoning_blocks) return;
+        const block = message.extra.reasoning_blocks.find(b => b.parserId === parserId);
+        if (!block) return;
+
+        const reasoningBlock = details.find('.mes_reasoning');
+        const textarea = document.createElement('textarea');
+        textarea.classList.add('reasoning_edit_textarea', 'mr_reasoning_edit_textarea');
+        textarea.value = block.content;
+        $(textarea).insertBefore(reasoningBlock);
+
+        if (!CSS.supports('field-sizing', 'content')) {
+            const resetHeight = function () {
+                textarea.style.height = '0px';
+                textarea.style.height = `${textarea.scrollHeight}px`;
+            };
+            textarea.addEventListener('input', resetHeight);
+            setTimeout(resetHeight, 0);
+        }
+
+        reasoningBlock.hide();
+        details.find('.mr_mes_reasoning_edit').hide();
+        details.find('.mr_mes_reasoning_edit_cancel').show();
+        details.find('.mr_mes_reasoning_edit_done').show();
+
+        textarea.focus();
+    });
+
+    $(document).on('click', '.mr_mes_reasoning_edit_cancel', function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+
+        const details = $(this).closest('.more-reasoning-details');
+        details.find('.mr_reasoning_edit_textarea').remove();
+        details.find('.mes_reasoning').show();
+        details.find('.mr_mes_reasoning_edit_cancel').hide();
+        details.find('.mr_mes_reasoning_edit_done').hide();
+        details.find('.mr_mes_reasoning_edit').show();
+    });
+
+    $(document).on('click', '.mr_mes_reasoning_edit_done', async function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+
+        const details = $(this).closest('.more-reasoning-details');
+        const messageBlock = details.closest('.mes');
+        const messageId = messageBlock.attr('mesid');
+        const message = chat[messageId];
+        const parserId = details.attr('data-parser-id');
+
+        if (!message || !message.extra?.reasoning_blocks) return;
+        const block = message.extra.reasoning_blocks.find(b => b.parserId === parserId);
+        if (!block) return;
+
+        const textarea = details.find('.mr_reasoning_edit_textarea');
+        const newContent = String(textarea.val());
+
+        if (block.content !== newContent) {
+            block.content = newContent;
+            // Native MESSAGE_UPDATED event triggers saves downstream
+            await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+        }
+
+        // Let the normal DOM update path refresh the element
+        const handler = new ReasoningHandler();
+        handler.updateDom(messageId);
+    });
+
     console.log(`[${MODULE_NAME}] Patching complete.`);
 }
 
@@ -681,26 +788,52 @@ eventSource.on(event_types.APP_READY, () => {
 async function checkAndParseMessage(messageId) {
     const message = chat[messageId];
     if (!message || message.is_user) return;
-    
-    // Skip if already parsed
-    if (message.extra?.reasoning_blocks?.length) return;
+
+    // Check if the content has actually changed since we last touched it.
+    // This correctly handles swipes, regenerations, and manual edits.
+    if (message.mes === message._mr_last_mes && message.extra?.reasoning_blocks?.length) {
+        return;
+    }
 
     const hasCustomTags = settings.parsers.some(
         p => p.enabled && p.prefix && p.suffix && message.mes.includes(p.prefix),
     );
 
     if (hasCustomTags) {
+        // Content changed and has new tags — clear old data and parse fresh.
+        if (message.extra?.reasoning_blocks) {
+            delete message.extra.reasoning_blocks;
+            delete message.extra.mr_has_custom_blocks;
+        }
         const handler = new ReasoningHandler();
         handler._mr_isReparsing = true; // suppress TTS event spam
         await handler.process(messageId, false);
+        message._mr_last_mes = message.mes;
+    } else if (message._mr_last_mes !== undefined && message.mes !== message._mr_last_mes) {
+        // Content changed and NO tags found — this means old blocks are definitely stale.
+        // We clear them to fix the "ghost boxes" on swipes.
+        if (message.extra?.reasoning_blocks) {
+            delete message.extra.reasoning_blocks;
+            delete message.extra.mr_has_custom_blocks;
+            // Update the DOM to remove the boxes
+            const handler = new ReasoningHandler();
+            handler.updateDom(messageId);
+        }
+        message._mr_last_mes = message.mes;
+    } else {
+        // First look at this message or no change — just mark the current state.
+        message._mr_last_mes = message.mes;
     }
 }
 
-// Catch messages from non-streamed inference and swipes
+// Catch messages from non-streamed inference and swipes.
 eventSource.on(event_types.MESSAGE_RECEIVED, async (messageId) => {
     await checkAndParseMessage(messageId);
 });
 
+eventSource.on(event_types.MESSAGE_SWIPED, async (messageId) => {
+    await checkAndParseMessage(messageId);
+});
 // Catch tags added during message edits
 eventSource.on(event_types.MESSAGE_UPDATED, async (messageId) => {
     await checkAndParseMessage(messageId);
