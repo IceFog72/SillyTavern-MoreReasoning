@@ -9,5 +9,5 @@
     "version": "0.1.0",
     "homePage": "https://github.com/IceFog72/SillyTavern-MoreReasoning",
     "auto_update": true,
-    "description": ""
+    "description": "Expand SillyTavern's reasoning system to support multiple independent reasoning parsers with custom tags, prompt injection controls and UI settings."
 }

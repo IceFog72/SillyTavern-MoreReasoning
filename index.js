@@ -71,14 +71,23 @@ let settings;
 
 function loadSettings() {
     const extensionSettings = extension_settings?.[MODULE_NAME] || {};
-    settings = Object.assign({}, defaultSettings, extensionSettings);
 
-    // Bug #7: Use neutral PARSER_DEFAULTS instead of defaultSettings.parsers[0]
-    if (settings.parsers) {
-        settings.parsers = settings.parsers.map(parser => ({
+    // Proper deep merge: start with defaults, then apply user overrides
+    settings = { ...defaultSettings };
+
+    // Merge parsers array instead of overwriting completely
+    if (extensionSettings.parsers && Array.isArray(extensionSettings.parsers)) {
+        // User saved parsers take precedence, merge with defaults
+        settings.parsers = extensionSettings.parsers.map(parser => ({
             ...PARSER_DEFAULTS,
             ...parser,
             id: parser.id || generateUUID(),
+        }));
+    } else {
+        // No user parsers, use defaults with proper defaults applied
+        settings.parsers = defaultSettings.parsers.map(parser => ({
+            ...PARSER_DEFAULTS,
+            ...parser,
         }));
     }
 
@@ -416,12 +425,17 @@ function patchReasoning() {
                 await eventSource.emit(event_types.STREAM_REASONING_DONE, '', 0, messageId, ReasoningState.Done);
             }
         } else {
-            delete message.extra.reasoning_blocks;
-            delete message.extra.mr_has_custom_blocks;
+            // Don't delete existing blocks if they exist — tags were already stripped
+            // from message.mes during first parse. This prevents MESSAGE_RECEIVED
+            // from clearing blocks after streaming completes.
+            if (!message.extra?.reasoning_blocks?.length) {
+                delete message.extra.reasoning_blocks;
+                delete message.extra.mr_has_custom_blocks;
+            }
 
             // Clean up placeholder if no custom blocks were found
             if (placeholderSet) {
-                if (message.extra.reasoning === '\u200B') {
+                if (message.extra?.reasoning === '\u200B') {
                     delete message.extra.reasoning;
                 }
                 // Reset handler state and re-render to remove placeholder UI
@@ -440,14 +454,17 @@ function patchReasoning() {
     // =========================================================================
     const originalIsLimitReached = PromptReasoning.prototype.isLimitReached;
     PromptReasoning.prototype.isLimitReached = function () {
+        // If native logic says we are not yet done, keep going
         if (!originalIsLimitReached.call(this)) {
             return false;
         }
+        // Check if any of our custom parsers still need more blocks
         const stillNeedsMore = settings.parsers.some(parser => {
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return false;
             const seen = this._mr_seen?.[parser.id] ?? 0;
             return seen < parser.maxAdditions;
         });
+        // Return true (limit reached) ONLY when both native is done AND we don't need any more blocks
         return !stillNeedsMore;
     };
 
@@ -483,9 +500,12 @@ function patchReasoning() {
         // isPrefix = true means the actively-streaming last message —
         // don't advance so the cursor stays in sync for future calls.
         const currentMessage = this._mr_sequence[this._mr_cursor];
-        if (!isPrefix) this._mr_cursor++;
+        if (!currentMessage?.extra?.reasoning_blocks?.length) {
+            if (!isPrefix) this._mr_cursor++;
+            return finalContent;
+        }
 
-        if (!currentMessage?.extra?.reasoning_blocks?.length) return finalContent;
+        if (!isPrefix) this._mr_cursor++;
 
         // Build the injection string from blocks according to parser settings
         let injection = '';
@@ -609,7 +629,12 @@ function patchReasoning() {
         }
         applyVisualHider();
 
-        if (!message?.extra?.reasoning_blocks?.length) return;
+        if (!message?.extra?.reasoning_blocks?.length) {
+            // No blocks — remove stale container if it exists
+            const container = messageDom.querySelector('.more-reasoning-container');
+            if (container) container.remove();
+            return;
+        }
 
         // -----------------------------------------------------------------------
         // Custom block container.
@@ -660,11 +685,11 @@ function patchReasoning() {
                             <span class="mes_reasoning_header_title">${headerTitle}</span>
                             <div class="mes_reasoning_arrow fa-solid fa-chevron-up"></div>
                         </div>
-                        <div class="mes_reasoning_actions flex-direction-row flex-container mr_mes_reasoning_actions" style="margin-top: 5px;">
-                            <div class="mr_mes_reasoning_edit_done menu_button edit_button fa-solid fa-check" title="Confirm" style="display:none"></div>
-                            <div class="mr_mes_reasoning_edit_cancel menu_button edit_button fa-solid fa-xmark" title="Cancel edit" style="display:none"></div>
-                            <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
-                        </div>
+                    </div>
+                    <div class="mes_reasoning_actions flex-direction-row flex-container mr_mes_reasoning_actions" style="margin-top: 5px;">
+                        <div class="mr_mes_reasoning_edit_done menu_button edit_button fa-solid fa-check" title="Confirm" style="display:none"></div>
+                        <div class="mr_mes_reasoning_edit_cancel menu_button edit_button fa-solid fa-xmark" title="Cancel edit" style="display:none"></div>
+                        <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
                     </div>
                 </summary>
                 <div class="mes_reasoning">${messageFormatting(block.content, '', false, false, messageId, {}, true)}</div>
@@ -686,12 +711,12 @@ function patchReasoning() {
     $(document).on('click', '.mes_reasoning_edit:not(.mr_mes_reasoning_edit)', function () {
         const mes = $(this).closest('.mes');
         if (!mes.length) return;
-        
+
         // Remove textareas ST mistakenly injected into our extension's custom blocks
         const errantTextareas = mes.find('.more-reasoning-details > .reasoning_edit_textarea:not(.mr_reasoning_edit_textarea)');
         if (errantTextareas.length > 0) {
             errantTextareas.remove();
-            
+
             // ST might have given focus to the wrong textarea clone. Regain focus on the native one.
             const nativeTextarea = mes.find('.reasoning_edit_textarea:not(.mr_reasoning_edit_textarea)').first();
             if (nativeTextarea.length) {
@@ -789,41 +814,23 @@ async function checkAndParseMessage(messageId) {
     const message = chat[messageId];
     if (!message || message.is_user) return;
 
-    // Check if the content has actually changed since we last touched it.
-    // This correctly handles swipes, regenerations, and manual edits.
-    if (message.mes === message._mr_last_mes && message.extra?.reasoning_blocks?.length) {
-        return;
-    }
-
-    const hasCustomTags = settings.parsers.some(
+    // Check if this message actually has raw tags that need parsing first
+    const hasRawTags = settings.parsers.some(
         p => p.enabled && p.prefix && p.suffix && message.mes.includes(p.prefix),
     );
 
-    if (hasCustomTags) {
-        // Content changed and has new tags — clear old data and parse fresh.
-        if (message.extra?.reasoning_blocks) {
-            delete message.extra.reasoning_blocks;
-            delete message.extra.mr_has_custom_blocks;
-        }
-        const handler = new ReasoningHandler();
-        handler._mr_isReparsing = true; // suppress TTS event spam
-        await handler.process(messageId, false);
-        message._mr_last_mes = message.mes;
-    } else if (message._mr_last_mes !== undefined && message.mes !== message._mr_last_mes) {
-        // Content changed and NO tags found — this means old blocks are definitely stale.
-        // We clear them to fix the "ghost boxes" on swipes.
-        if (message.extra?.reasoning_blocks) {
-            delete message.extra.reasoning_blocks;
-            delete message.extra.mr_has_custom_blocks;
-            // Update the DOM to remove the boxes
-            const handler = new ReasoningHandler();
-            handler.updateDom(messageId);
-        }
-        message._mr_last_mes = message.mes;
-    } else {
-        // First look at this message or no change — just mark the current state.
-        message._mr_last_mes = message.mes;
+    // ONLY clear existing blocks IF we detected new raw tags to parse
+    // This means:
+    //  ✅ New messages/swipes get completely reparsed from scratch
+    //  ✅ Already parsed historical messages are left completely untouched
+    if (hasRawTags && message.extra) {
+        delete message.extra.reasoning_blocks;
+        delete message.extra.mr_has_custom_blocks;
     }
+
+    const handler = new ReasoningHandler();
+    handler._mr_isReparsing = true;
+    await handler.process(messageId, false);
 }
 
 // Catch messages from non-streamed inference and swipes.
@@ -835,23 +842,31 @@ eventSource.on(event_types.MESSAGE_SWIPED, async (messageId) => {
     await checkAndParseMessage(messageId);
 });
 // Catch tags added during message edits
+let _mr_handlingMessageUpdate = false;
 eventSource.on(event_types.MESSAGE_UPDATED, async (messageId) => {
-    await checkAndParseMessage(messageId);
+    // Prevent infinite loop when we emit MESSAGE_UPDATED ourselves after editing blocks
+    if (_mr_handlingMessageUpdate) return;
+    _mr_handlingMessageUpdate = true;
+    try {
+        await checkAndParseMessage(messageId);
+    } finally {
+        _mr_handlingMessageUpdate = false;
+    }
 });
 
 // Bug #4: CHARACTER_MESSAGE_RENDERED for per-message DOM patching (hot path)
 eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => {
     const message = chat[messageId];
     if (!message || message.is_user) return;
-    if (message.extra?.reasoning_blocks?.length) {
-        const handler = new ReasoningHandler();
-        handler.updateDom(messageId);
-    }
+
+    // Always force updateDom on render - fixes swipe navigation not showing blocks
+    const handler = new ReasoningHandler();
+    handler.updateDom(messageId);
 });
 
 // Bug #4: CHAT_LOADED fallback for initial parse of unprocessed messages
 eventSource.on(event_types.CHAT_LOADED, () => {
-    setTimeout(reparseAllMessages, 1000);
+    reparseAllMessages();
 });
 
 // Bug #5: Clean up MutationObservers on chat switch to prevent memory leaks
