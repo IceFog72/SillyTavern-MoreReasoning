@@ -107,7 +107,10 @@ function init() {
  */
 function injectUI() {
     const $target = $('#reasoning_add_to_prompts').closest('.flex-container').parent();
-    if (!$target.length) return;
+    if (!$target.length) {
+        console.error(`[${MODULE_NAME}] Could not find injection target - Settings UI will be unavailable`);
+        return;
+    }
 
     const html = `
         <div class="more-reasoning-settings-container">
@@ -400,6 +403,7 @@ function patchReasoning() {
             // so the original handler doesn't hit its early return
             if (foundBlocks.length > 0 && !this.reasoning) {
                 this.reasoning = '\u200B';
+                message.extra._mr_is_placeholder = true;
                 placeholderSet = true;
             }
         }
@@ -422,9 +426,7 @@ function patchReasoning() {
         // After the original handler, process custom blocks
         if (foundBlocks.length > 0) {
             message.extra.reasoning_blocks = foundBlocks;
-            // Bug #6: Use dedicated property instead of ZWS fingerprint
             message.extra.mr_has_custom_blocks = true;
-            message.extra.mr_swipe_id = message.swipe_id ?? 0;
 
             // Bug #3: Only emit STREAM_REASONING_DONE during live streaming,
             // not during re-parses (which would flood TTS subscribers)
@@ -432,22 +434,17 @@ function patchReasoning() {
                 await eventSource.emit(event_types.STREAM_REASONING_DONE, '', 0, messageId, ReasoningState.Done);
             }
         } else {
-            // Don't delete existing blocks if they exist — tags were already stripped
-            // from message.mes during first parse. This prevents MESSAGE_RECEIVED
-            // from clearing blocks after streaming completes.
-            const currentSwipeId = message.swipe_id ?? 0;
-            if (!message.extra?.reasoning_blocks?.length || (message.extra.mr_swipe_id !== undefined && message.extra.mr_swipe_id !== currentSwipeId)) {
-                if (message.extra) {
-                    delete message.extra.reasoning_blocks;
-                    delete message.extra.mr_has_custom_blocks;
-                    delete message.extra.mr_swipe_id;
-                }
-            }
-
+            // Only clear blocks if we detected new raw tags to re-parse.
+            // DO NOT clear blocks just because swipe IDs changed.
+            // This preserves reasoning blocks across swipes without tags.
+            
             // Clean up placeholder if no custom blocks were found
             if (placeholderSet) {
                 if (message.extra?.reasoning === '\u200B') {
                     delete message.extra.reasoning;
+                }
+                if (message.extra?._mr_is_placeholder) {
+                    delete message.extra._mr_is_placeholder;
                 }
                 // Reset handler state and re-render to remove placeholder UI
                 this.state = ReasoningState.None;
@@ -620,7 +617,10 @@ function patchReasoning() {
             });
 
             if (stripped) {
-                if (mesText._mrObserver) mesText._mrObserver.disconnect();
+                if (mesText._mrObserver) {
+                    mesText._mrObserver.disconnect();
+                    mesText._mrObserver = null;
+                }
                 mesText.innerHTML = messageFormatting(
                     displayMes.trim(),
                     message.name,
@@ -628,7 +628,8 @@ function patchReasoning() {
                     message.is_user,
                     messageId
                 );
-                if (mesText._mrObserver) {
+                if (!mesText._mrObserver) {
+                    mesText._mrObserver = new MutationObserver(() => applyVisualHider());
                     mesText._mrObserver.observe(mesText, { childList: true, characterData: true, subtree: true });
                 }
             }
@@ -830,18 +831,10 @@ async function checkAndParseMessage(messageId) {
         p => p.enabled && p.prefix && p.suffix && message.mes.includes(p.prefix),
     );
 
-    const currentSwipeId = message.swipe_id ?? 0;
-    const isStaleSwipe = message.extra && message.extra.mr_swipe_id !== undefined && message.extra.mr_swipe_id !== currentSwipeId;
-
-    // ONLY clear existing blocks IF we detected new raw tags to parse, or if the blocks are stale copies
-    // This means:
-    //  ✅ New messages/swipes get completely reparsed from scratch
-    //  ✅ Stale blocks copied by ST to a new swipe without tags get cleared
-    //  ✅ Already parsed historical messages are left completely untouched
-    if ((hasRawTags || isStaleSwipe) && message.extra) {
+    // Only clear existing blocks IF we detected new raw tags to parse
+    if (hasRawTags && message.extra) {
         delete message.extra.reasoning_blocks;
         delete message.extra.mr_has_custom_blocks;
-        delete message.extra.mr_swipe_id;
     }
 
     const handler = new ReasoningHandler();
