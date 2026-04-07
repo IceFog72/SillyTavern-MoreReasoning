@@ -6,9 +6,6 @@ import { extension_settings } from '../../../extensions.js';
 
 const MODULE_NAME = 'MoreReasoning';
 
-// =========================================================================
-// Bug #7: Neutral parser defaults (not tied to any specific parser)
-// =========================================================================
 const PARSER_DEFAULTS = {
     id: '', name: 'Parser', prefix: '', suffix: '', separator: '\n\n',
     maxAdditions: 1, enabled: true, autoExpand: false,
@@ -451,8 +448,6 @@ function patchReasoning() {
             message.extra.reasoning_blocks = foundBlocks;
             message.extra.mr_has_custom_blocks = true;
 
-            // Bug #3: Only emit STREAM_REASONING_DONE during live streaming,
-            // not during re-parses (which would flood TTS subscribers)
             if (!this._mr_isReparsing) {
                 await eventSource.emit(event_types.STREAM_REASONING_DONE, '', 0, messageId, ReasoningState.Done);
             }
@@ -715,8 +710,8 @@ function patchReasoning() {
             // Add custom reasoning actions with edit buttons
             details.innerHTML = `
                 <summary class="mes_reasoning_summary flex-container">
-                    <div class="mes_reasoning_header_block flex-container">
-                        <div class="mes_reasoning_header flex-container">
+                    <div class="mes_reasoning_header_block mr_mes_reasoning_header_block flex-container">
+                        <div class="mes_reasoning_header mr_mes_reasoning_header flex-container">
                             <span class="mes_reasoning_header_title">${headerTitle}</span>
                             <div class="mes_reasoning_arrow fa-solid fa-chevron-up"></div>
                         </div>
@@ -727,7 +722,7 @@ function patchReasoning() {
                         <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
                     </div>
                 </summary>
-                <div class="mes_reasoning">${messageFormatting(block.content, '', false, false, messageId, {}, true)}</div>
+                <div class="mr_mes_reasoning">${messageFormatting(block.content, '', false, false, messageId, {}, true)}</div>
 
             `;
             multiContainer.appendChild(details);
@@ -740,28 +735,8 @@ function patchReasoning() {
         }
     };
 
-    // Bug #8: Prevent ST's native edit button from spawning duplicate textareas above custom blocks.
-    // ST uses messageBlock.find('.mes_reasoning') which blindly matches our custom blocks.
-    // Because ST sometimes triggers this programmatically via $.trigger('click'), native capture doesn't work.
-    $(document).on('click', '.mes_reasoning_edit:not(.mr_mes_reasoning_edit)', function () {
-        const mes = $(this).closest('.mes');
-        if (!mes.length) return;
-
-        // Remove textareas ST mistakenly injected into our extension's custom blocks
-        const errantTextareas = mes.find('.more-reasoning-details > .reasoning_edit_textarea:not(.mr_reasoning_edit_textarea)');
-        if (errantTextareas.length > 0) {
-            errantTextareas.remove();
-
-            // ST might have given focus to the wrong textarea clone. Regain focus on the native one.
-            const nativeTextarea = mes.find('.reasoning_edit_textarea:not(.mr_reasoning_edit_textarea)').first();
-            if (nativeTextarea.length) {
-                nativeTextarea.focus();
-            }
-        }
-    });
-
-    // Custom block editing handlers
-    $(document).on('click', '.mr_mes_reasoning_edit', function (e) {
+    // Custom block editing handlers - these need to target custom blocks only
+    $(document).on('click', '.more-reasoning-details .mr_mes_reasoning_edit', function (e) {
         e.stopPropagation();
         e.preventDefault();
 
@@ -775,7 +750,7 @@ function patchReasoning() {
         const block = message.extra.reasoning_blocks.find(b => b.parserId === parserId);
         if (!block) return;
 
-        const reasoningBlock = details.find('.mes_reasoning');
+        const reasoningBlock = details.find('.mr_mes_reasoning');
         const textarea = document.createElement('textarea');
         textarea.classList.add('reasoning_edit_textarea', 'mr_reasoning_edit_textarea');
         textarea.value = block.content;
@@ -804,7 +779,7 @@ function patchReasoning() {
 
         const details = $(this).closest('.more-reasoning-details');
         details.find('.mr_reasoning_edit_textarea').remove();
-        details.find('.mes_reasoning').show();
+        details.find('.mr_mes_reasoning').show();
         details.find('.mr_mes_reasoning_edit_cancel').hide();
         details.find('.mr_mes_reasoning_edit_done').hide();
         details.find('.mr_mes_reasoning_edit').show();
@@ -886,7 +861,7 @@ eventSource.on(event_types.MESSAGE_UPDATED, async (messageId) => {
     }
 });
 
-// Bug #4: CHARACTER_MESSAGE_RENDERED for per-message DOM patching (hot path)
+// CHARACTER_MESSAGE_RENDERED for per-message DOM patching (hot path)
 eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => {
     const message = chat[messageId];
     if (!message || message.is_user) return;
@@ -896,12 +871,12 @@ eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => {
     handler.updateDom(messageId);
 });
 
-// Bug #4: CHAT_LOADED fallback for initial parse of unprocessed messages
+// CHAT_LOADED fallback for initial parse of unprocessed messages
 eventSource.on(event_types.CHAT_LOADED, () => {
     reparseAllMessages();
 });
 
-// Bug #5: Clean up MutationObservers on chat switch to prevent memory leaks
+// Clean up MutationObservers on chat switch to prevent memory leaks
 eventSource.on(event_types.CHAT_CHANGED, () => {
     document.querySelectorAll('.mes_text').forEach(el => {
         if (el._mrObserver) {
