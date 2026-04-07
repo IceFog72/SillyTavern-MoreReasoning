@@ -260,6 +260,7 @@ async function reparseAllMessages() {
         if (message.extra?.reasoning_blocks?.length) {
             _stripTagsFromMes(message);
             const handler = new ReasoningHandler();
+            handler._mr_isReparsing = true;
             handler.updateDom(i);
             processedCount++;
             continue;
@@ -322,6 +323,33 @@ function patchReasoning() {
             return;
         }
         return originalFinish.call(this, messageId);
+    };
+
+    // =========================================================================
+    // Patch initHandleMessage() - detect overswipes (reset: true) and clear stale blocks
+    // =========================================================================
+    const originalInitHandleMessage = ReasoningHandler.prototype.initHandleMessage;
+    ReasoningHandler.prototype.initHandleMessage = function (messageIdOrElement, { reset = false } = {}) {
+        if (reset) {
+            const messageId = typeof messageIdOrElement === 'number'
+                ? messageIdOrElement
+                : Number(window.jQuery(messageIdOrElement).closest('.mes').attr('mesid'));
+
+            if (!isNaN(messageId) && chat[messageId]) {
+                const message = chat[messageId];
+                if (message.extra) {
+                    // Clear ALL reasoning-related fields to prevent carry-over/flicker during swiping.
+                    // This includes native fields because SillyTavern's syncMesToSwipe copies them.
+                    delete message.extra.reasoning_blocks;
+                    delete message.extra.mr_has_custom_blocks;
+                    delete message.extra.reasoning;
+                    delete message.extra.reasoning_type;
+                    delete message.extra.reasoning_duration;
+                    delete message.extra._mr_is_placeholder;
+                }
+            }
+        }
+        return originalInitHandleMessage.apply(this, arguments);
     };
 
     // =========================================================================
@@ -659,6 +687,14 @@ function patchReasoning() {
         }
         applyVisualHider();
 
+        // Hide custom container if the handler was reset (e.g., during swiping animation)
+        // or if it's a hidden reasoning model starting a fresh thought.
+        if ((this.state === ReasoningState.None || (this.state === ReasoningState.Thinking && !this.reasoning)) && !this._mr_isReparsing) {
+            const container = messageDom.querySelector('.more-reasoning-container');
+            if (container) container.remove();
+            return;
+        }
+
         if (!message?.extra?.reasoning_blocks?.length) {
             // No blocks — remove stale container if it exists
             const container = messageDom.querySelector('.more-reasoning-container');
@@ -820,7 +856,7 @@ eventSource.on(event_types.APP_READY, () => {
     init();
 });
 
-async function checkAndParseMessage(messageId) {
+async function checkAndParseMessage(messageId, forceReset = false) {
     const message = chat[messageId];
     if (!message || message.is_user) return;
 
@@ -829,8 +865,14 @@ async function checkAndParseMessage(messageId) {
         p => p.enabled && p.prefix && p.suffix && message.mes.includes(p.prefix),
     );
 
-    // Only clear existing blocks IF we detected new raw tags to parse
-    if (hasRawTags && message.extra) {
+    // Also check if this is a fresh overswipe starting (SillyTavern sets mes to '...')
+    const isNewGeneration = message.mes === '...';
+
+    // Clear existing blocks if:
+    // 1. Force reset (e.g., manually triggered refreshing), OR
+    // 2. New raw tags detected (needs re-parsing), OR
+    // 3. New generation starting (to clear stale blocks from copied variant)
+    if ((forceReset || hasRawTags || isNewGeneration) && message.extra) {
         delete message.extra.reasoning_blocks;
         delete message.extra.mr_has_custom_blocks;
     }
@@ -846,7 +888,11 @@ eventSource.on(event_types.MESSAGE_RECEIVED, async (messageId) => {
 });
 
 eventSource.on(event_types.MESSAGE_SWIPED, async (messageId) => {
-    await checkAndParseMessage(messageId);
+    // DO NOT force reset here anymore.
+    // If it's a new generation, checkAndParseMessage will detect '...' and clear.
+    // If it's a return to an old swipe, ST core has already restored the 'extra' data,
+    // and we want to preserve it rather than clearing it unconditionally.
+    await checkAndParseMessage(messageId, false);
 });
 // Catch tags added during message edits
 let _mr_handlingMessageUpdate = false;
