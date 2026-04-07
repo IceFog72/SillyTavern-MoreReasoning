@@ -1,12 +1,12 @@
 {
-    "display_name": "SillyTavern-MoreReasoning",
+    "display_name": "MoreReasoning",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "icefog72",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "homePage": "https://github.com/IceFog72/SillyTavern-MoreReasoning",
     "auto_update": true,
     "description": "Expand SillyTavern's reasoning system to support multiple independent reasoning parsers with custom tags, prompt injection controls and UI settings."

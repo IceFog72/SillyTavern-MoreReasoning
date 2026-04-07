@@ -363,6 +363,29 @@ function patchReasoning() {
                 }
 
                 if (matchedParser) {
+                    // Check if this tag is nested inside another parser's tags.
+                    // If so, don't extract it — let the parent parser handle it.
+                    let isNested = false;
+                    for (const otherParser of activeParsers) {
+                        if (otherParser.id === matchedParser.id) continue;
+                        const otherStartPos = workingContent.lastIndexOf(otherParser.prefix, earliestPrefix);
+                        if (otherStartPos !== -1) {
+                            const otherSuffixPos = workingContent.indexOf(otherParser.suffix, earliestPrefix);
+                            if (otherSuffixPos !== -1 && otherSuffixPos > earliestPrefix) {
+                                // This tag is inside another parser's scope — skip it
+                                isNested = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (isNested) {
+                        // Skip this tag, include it in cleanedMes as raw text
+                        cleanedMes += workingContent.substring(i, i + matchedParser.prefix.length);
+                        i += matchedParser.prefix.length;
+                        continue;
+                    }
+
                     // Accumulate content BEFORE this tag into cleanedMes
                     cleanedMes += workingContent.substring(i, earliestPrefix);
                     const contentStart = earliestPrefix + matchedParser.prefix.length;
