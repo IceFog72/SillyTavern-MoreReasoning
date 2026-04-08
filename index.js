@@ -75,11 +75,29 @@ function loadSettings() {
     // Merge parsers array instead of overwriting completely
     if (extensionSettings.parsers && Array.isArray(extensionSettings.parsers)) {
         // User saved parsers take precedence, merge with defaults
-        settings.parsers = extensionSettings.parsers.map(parser => ({
-            ...PARSER_DEFAULTS,
-            ...parser,
-            id: parser.id || generateUUID(),
-        }));
+        const seenIds = new Set();
+        settings.parsers = extensionSettings.parsers.map(parser => {
+            let id = parser.id || generateUUID();
+            if (id.startsWith('parser_') || id.startsWith('mr_')) {
+                const cleanPrefix = parser.prefix?.replace(/[<>().,]/g, '').trim();
+                // If it's a legacy auto-gen ID, prefer using the tag prefix for the new ID
+                id = cleanPrefix || id;
+            }
+
+            // Ensure uniqueness within the current settings
+            let finalId = id;
+            let counter = 1;
+            while (seenIds.has(finalId)) {
+                finalId = `${id}_${counter++}`;
+            }
+            seenIds.add(finalId);
+
+            return {
+                ...PARSER_DEFAULTS,
+                ...parser,
+                id: finalId,
+            };
+        });
     } else {
         // No user parsers, use defaults with proper defaults applied
         settings.parsers = defaultSettings.parsers.map(parser => ({
@@ -226,8 +244,24 @@ function renderParsers() {
 function saveSettings() {
     extension_settings[MODULE_NAME] = settings;
     saveSettingsDebounced();
-    // Reparse the chat if settings changed (e.g. a new parser was added)
+    // Reparse the chat if settings changed (e.g. a new parser was added or ID migrated)
     reparseAllMessages();
+}
+
+/**
+ * Safely find a parser by its ID, with fallback for migrated legacy IDs.
+ * @param {string} id - The parser ID to find
+ * @returns {MoreReasoningParser|undefined}
+ */
+function getParser(id) {
+    if (!id) return;
+    let parser = settings.parsers.find(p => p.id === id);
+    // Legacy fallback: check if it's an old 'mr_' or 'parser_' prefixed ID
+    if (!parser && (id.startsWith('mr_') || id.startsWith('parser_'))) {
+        const cleanId = id.replace(/^(mr_|parser_)/, '');
+        parser = settings.parsers.find(p => p.id === cleanId);
+    }
+    return parser;
 }
 
 // =========================================================================
@@ -293,7 +327,7 @@ function _stripTagsFromMes(message) {
     if (!message.extra?.reasoning_blocks?.length) return;
 
     for (const block of message.extra.reasoning_blocks) {
-        const parser = settings.parsers.find(p => p.id === block.parserId);
+        const parser = getParser(block.parserId);
         if (!parser || !parser.prefix || !parser.suffix) continue;
 
         const fullTag = block.incomplete
@@ -339,7 +373,6 @@ function patchReasoning() {
                 const message = chat[messageId];
                 if (message.extra) {
                     // Clear ALL reasoning-related fields to prevent carry-over/flicker during swiping.
-                    // This includes native fields because SillyTavern's syncMesToSwipe copies them.
                     delete message.extra.reasoning_blocks;
                     delete message.extra.mr_has_custom_blocks;
                     delete message.extra.reasoning;
@@ -349,7 +382,20 @@ function patchReasoning() {
                 }
             }
         }
-        return originalInitHandleMessage.apply(this, arguments);
+
+        const result = originalInitHandleMessage.apply(this, arguments);
+
+        // If SillyTavern didn't find its own reasoning but we have custom blocks,
+        // force state to Done so updateDom doesn't skip rendering them.
+        const messageId = typeof messageIdOrElement === 'number'
+            ? messageIdOrElement
+            : Number(window.jQuery(messageIdOrElement).closest('.mes').attr('mesid'));
+        const message = chat[messageId];
+        if (message?.extra?.reasoning_blocks?.length && this.state === ReasoningState.None) {
+            this.state = ReasoningState.Done;
+        }
+
+        return result;
     };
 
     // =========================================================================
@@ -483,19 +529,22 @@ function patchReasoning() {
             // Only clear blocks if we detected new raw tags to re-parse.
             // DO NOT clear blocks just because swipe IDs changed.
             // This preserves reasoning blocks across swipes without tags.
-            
-            // Clean up placeholder if no custom blocks were found
-            if (placeholderSet) {
+
+            // Clean up placeholder if no custom blocks were found in this pass,
+            // but a placeholder was previously set.
+            if (message.extra?._mr_is_placeholder) {
                 if (message.extra?.reasoning === '\u200B') {
                     delete message.extra.reasoning;
                 }
-                if (message.extra?._mr_is_placeholder) {
-                    delete message.extra._mr_is_placeholder;
-                }
+                delete message.extra._mr_is_placeholder;
+
                 // Reset handler state and re-render to remove placeholder UI
-                this.state = ReasoningState.None;
-                this.reasoning = '';
-                this.type = null;
+                // Only if native reasoning isn't actually using the handler now.
+                if (!this.reasoning) {
+                    this.state = ReasoningState.None;
+                    this.reasoning = '';
+                    this.type = null;
+                }
             }
         }
 
@@ -564,7 +613,7 @@ function patchReasoning() {
         // Build the injection string from blocks according to parser settings
         let injection = '';
         currentMessage.extra.reasoning_blocks.forEach(block => {
-            const parser = settings.parsers.find(p => p.id === block.parserId);
+            const parser = getParser(block.parserId);
             if (!parser || !parser.prefix || !parser.suffix) return;
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return;
 
@@ -651,7 +700,7 @@ function patchReasoning() {
             let stripped = false;
 
             message.extra.reasoning_blocks.forEach(block => {
-                const parser = settings.parsers.find(p => p.id === block.parserId);
+                const parser = getParser(block.parserId);
                 if (parser && parser.prefix && parser.suffix) {
                     const suffixToUse = block.incomplete ? '' : parser.suffix;
                     const exactString = parser.prefix + block.content + suffixToUse;
@@ -689,7 +738,8 @@ function patchReasoning() {
 
         // Hide custom container if the handler was reset (e.g., during swiping animation)
         // or if it's a hidden reasoning model starting a fresh thought.
-        if ((this.state === ReasoningState.None || (this.state === ReasoningState.Thinking && !this.reasoning)) && !this._mr_isReparsing) {
+        // GUARD: Do NOT remove if we have custom reasoning blocks to show.
+        if (!message.extra?.reasoning_blocks?.length && (this.state === ReasoningState.None || (this.state === ReasoningState.Thinking && !this.reasoning)) && !this._mr_isReparsing) {
             const container = messageDom.querySelector('.more-reasoning-container');
             if (container) container.remove();
             return;
@@ -728,8 +778,8 @@ function patchReasoning() {
         }
 
         multiContainer.innerHTML = '';
-        message.extra.reasoning_blocks.forEach(block => {
-            const parser = settings.parsers.find(p => p.id === block.parserId);
+        message.extra.reasoning_blocks.forEach((block, blockIndex) => {
+            const parser = getParser(block.parserId);
             if (!parser) return;
             if (!parser.enabled) return; // parser disabled — don't show its blocks
 
@@ -737,6 +787,11 @@ function patchReasoning() {
             // 'mes_reasoning_details' for ST CSS styling,
             // 'more-reasoning-details' as our own class + :not() guard above
             details.className = 'mes_reasoning_details more-reasoning-details';
+
+            // Build a descriptive ID for CSS targeting: parser_{tag}_{messageId}_{index}
+            const cleanTag = parser.prefix.replace(/[<>().,]/g, '').trim() || 'block';
+            details.id = `parser_${cleanTag}_${messageId}_${blockIndex}`;
+
             details.dataset.parserId = parser.id; // required for editing
             if (block.incomplete) details.dataset.state = 'thinking';
             if (parser.autoExpand || block.incomplete) details.open = true;

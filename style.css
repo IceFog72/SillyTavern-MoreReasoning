@@ -1,10 +1,8 @@
 .more-reasoning-container {
-    margin-bottom: 0.3rem;
     overflow: auto;
 }
 
 .more-reasoning-details {
-    margin-bottom: 0.3rem;
     border: 1px solid color-mix(in srgb, var(--borderColor), transparent 60%);
     border-radius: 0.3rem;
     padding: 0.125rem;
@@ -18,7 +16,7 @@
 }
 
 
-.mr_mes_reasoning{
+.mr_mes_reasoning {
     display: block;
     border-left: 2px solid var(--reasoning-body-color);
     border-radius: 2px;
