@@ -554,6 +554,10 @@ function patchReasoning() {
     // =========================================================================
     // Patch PromptReasoning.isLimitReached — keep the ST prompt-builder loop
     // alive for our custom parsers even when native reasoning is disabled.
+    //
+    // CRITICAL FIX: Track per-message counts to avoid stopping the loop
+    // prematurely when custom blocks on newer messages fill their limits,
+    // preventing native reasoning on older messages from being added.
     // =========================================================================
     const originalIsLimitReached = PromptReasoning.prototype.isLimitReached;
     PromptReasoning.prototype.isLimitReached = function () {
@@ -562,10 +566,20 @@ function patchReasoning() {
             return false;
         }
         // Check if any of our custom parsers still need more blocks
+        // Track per-parser: have we added maxAdditions blocks across messages?
         const stillNeedsMore = settings.parsers.some(parser => {
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return false;
-            const seen = this._mr_seen?.[parser.id] ?? 0;
-            return seen < parser.maxAdditions;
+            
+            // Count total blocks added for this parser
+            const totalSeen = this._mr_seenTotal?.[parser.id] ?? 0;
+            
+            // Keep the loop alive as long as we haven't reached maxAdditions yet
+            // OR until we've processed all messages
+            const hasMoreMessages = this._mr_cursor < (this._mr_sequence?.length ?? 0);
+            const stillNeedsBlocks = totalSeen < parser.maxAdditions;
+            
+            // Continue if we need more blocks AND have more messages to check
+            return stillNeedsBlocks && hasMoreMessages;
         });
         // Return true (limit reached) ONLY when both native is done AND we don't need any more blocks
         return !stillNeedsMore;
@@ -589,14 +603,14 @@ function patchReasoning() {
         // Per-instance state — reset each generation (new PromptReasoning() each time)
         if (!this._mr_initialized) {
             this._mr_initialized = true;
-            this._mr_seen = {};
-            settings.parsers.forEach(p => { this._mr_seen[p.id] = 0; });
+            this._mr_seenTotal = {};  // Global counter: total blocks added per parser
+            settings.parsers.forEach(p => { this._mr_seenTotal[p.id] = 0; });
             // Sequence mirrors coreChat: non-system messages, newest first
             this._mr_sequence = chat.filter(m => !m.is_system).reverse();
             this._mr_cursor = 0;
         }
 
-        // Call original first — native reasoning handled untouched
+        // Call original to get native reasoning (prepended to content)
         let finalContent = originalAddToMessage.call(this, content, reasoning, isPrefix, duration);
 
         // Advance cursor to pick up this message's reasoning_blocks.
@@ -617,16 +631,25 @@ function patchReasoning() {
             if (!parser || !parser.prefix || !parser.suffix) return;
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return;
 
-            // Newest-first counter: keep first maxAdditions occurrences
-            this._mr_seen[parser.id]++;
-            if (this._mr_seen[parser.id] <= parser.maxAdditions) {
+            // Track total blocks added for this parser across all messages
+            this._mr_seenTotal[parser.id]++;
+            
+            // Only add if we haven't hit the limit yet
+            if (this._mr_seenTotal[parser.id] <= parser.maxAdditions) {
                 const sep = substituteParams(parser.separator || '');
                 injection += parser.prefix + block.content + parser.suffix + sep;
             }
         });
 
         if (injection) {
-            finalContent = injection + finalContent;
+            // Reorganize to maintain: [native reasoning] [custom reasoning] [content]
+            // Original call gives us: native_wrapped + content
+            // We need to extract native_wrapped and rebuild with injection in between
+            const contentIndex = finalContent.lastIndexOf(content);
+            if (contentIndex !== -1) {
+                const nativeWrapped = finalContent.substring(0, contentIndex);
+                finalContent = nativeWrapped + injection + content;
+            }
         }
 
         return finalContent;
