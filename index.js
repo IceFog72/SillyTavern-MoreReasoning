@@ -463,16 +463,20 @@ function patchReasoning() {
                     const suffixPos = workingContent.indexOf(matchedParser.suffix, contentStart);
 
                     if (suffixPos !== -1) {
+                        const rawContent = workingContent.substring(contentStart, suffixPos);
                         foundBlocks.push({
                             parserId: matchedParser.id,
-                            content: workingContent.substring(contentStart, suffixPos),
+                            content: rawContent,
+                            expandedContent: substituteParams(rawContent),
                             duration: 0,
                         });
                         i = suffixPos + matchedParser.suffix.length;
                     } else {
+                        const rawContent = workingContent.substring(contentStart);
                         foundBlocks.push({
                             parserId: matchedParser.id,
-                            content: workingContent.substring(contentStart),
+                            content: rawContent,
+                            expandedContent: substituteParams(rawContent),
                             duration: 0,
                             incomplete: true,
                         });
@@ -604,8 +608,11 @@ function patchReasoning() {
         if (!this._mr_initialized) {
             this._mr_initialized = true;
             this._mr_seenTotal = {};  // Global counter: total blocks added per parser
-            this._mr_completedParsers = new Set();  // Track which parsers already have a complete block
-            settings.parsers.forEach(p => { this._mr_seenTotal[p.id] = 0; });
+            this._mr_completedCount = {};  // Track complete blocks added per parser
+            settings.parsers.forEach(p => { 
+                this._mr_seenTotal[p.id] = 0;
+                this._mr_completedCount[p.id] = 0;
+            });
             // Sequence mirrors coreChat: non-system messages, newest first
             this._mr_sequence = chat.filter(m => !m.is_system).reverse();
             this._mr_cursor = 0;
@@ -626,15 +633,21 @@ function patchReasoning() {
         if (!isPrefix) this._mr_cursor++;
 
         // Build the injection string from blocks according to parser settings
+        // Track which parsers have added a complete block from THIS message
+        const addedCompleteThisMessage = new Set();
         let injection = '';
         currentMessage.extra.reasoning_blocks.forEach(block => {
             const parser = getParser(block.parserId);
             if (!parser || !parser.prefix || !parser.suffix) return;
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return;
 
-            // Skip if this is a completed block and we've already added a completed block for this parser
             const isComplete = !block.incomplete;
-            if (isComplete && this._mr_completedParsers.has(parser.id)) return;
+            
+            // Skip if this is a completed block and we've already added one complete block for this parser from this message
+            if (isComplete && addedCompleteThisMessage.has(parser.id)) return;
+            
+            // Skip if we've already added Max complete blocks for this parser across all messages
+            if (isComplete && this._mr_completedCount[parser.id] >= parser.maxAdditions) return;
 
             // Track total blocks added for this parser across all messages
             this._mr_seenTotal[parser.id]++;
@@ -644,13 +657,14 @@ function patchReasoning() {
                 const prefix = substituteParams(parser.prefix);
                 const suffix = substituteParams(parser.suffix);
                 const sep = substituteParams(parser.separator || '');
-                // Parse macros in AI output (block.content) before injecting into prompt
-                const expandedContent = substituteParams(block.content);
-                injection += prefix + expandedContent + suffix + sep;
+                // Use cached expandedContent that was frozen when block was created
+                const content = block.expandedContent || substituteParams(block.content);
+                injection += prefix + content + suffix + sep;
                 
-                // Mark this parser as having a completed block
+                // Mark this parser as having added a complete block from this message
                 if (isComplete) {
-                    this._mr_completedParsers.add(parser.id);
+                    addedCompleteThisMessage.add(parser.id);
+                    this._mr_completedCount[parser.id]++;
                 }
             }
         });
@@ -850,7 +864,7 @@ function patchReasoning() {
                         <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
                     </div>
                 </summary>
-                <div class="mr_mes_reasoning">${messageFormatting(substituteParams(block.content), '', false, false, messageId, {}, true)}</div>
+                <div class="mr_mes_reasoning">${messageFormatting(block.expandedContent || substituteParams(block.content), '', false, false, messageId, {}, true)}</div>
 
             `;
             multiContainer.appendChild(details);
