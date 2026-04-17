@@ -604,6 +604,7 @@ function patchReasoning() {
         if (!this._mr_initialized) {
             this._mr_initialized = true;
             this._mr_seenTotal = {};  // Global counter: total blocks added per parser
+            this._mr_completedParsers = new Set();  // Track which parsers already have a complete block
             settings.parsers.forEach(p => { this._mr_seenTotal[p.id] = 0; });
             // Sequence mirrors coreChat: non-system messages, newest first
             this._mr_sequence = chat.filter(m => !m.is_system).reverse();
@@ -631,13 +632,26 @@ function patchReasoning() {
             if (!parser || !parser.prefix || !parser.suffix) return;
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return;
 
+            // Skip if this is a completed block and we've already added a completed block for this parser
+            const isComplete = !block.incomplete;
+            if (isComplete && this._mr_completedParsers.has(parser.id)) return;
+
             // Track total blocks added for this parser across all messages
             this._mr_seenTotal[parser.id]++;
             
             // Only add if we haven't hit the limit yet
             if (this._mr_seenTotal[parser.id] <= parser.maxAdditions) {
+                const prefix = substituteParams(parser.prefix);
+                const suffix = substituteParams(parser.suffix);
                 const sep = substituteParams(parser.separator || '');
-                injection += parser.prefix + block.content + parser.suffix + sep;
+                // Parse macros in AI output (block.content) before injecting into prompt
+                const expandedContent = substituteParams(block.content);
+                injection += prefix + expandedContent + suffix + sep;
+                
+                // Mark this parser as having a completed block
+                if (isComplete) {
+                    this._mr_completedParsers.add(parser.id);
+                }
             }
         });
 
@@ -836,7 +850,7 @@ function patchReasoning() {
                         <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
                     </div>
                 </summary>
-                <div class="mr_mes_reasoning">${messageFormatting(block.content, '', false, false, messageId, {}, true)}</div>
+                <div class="mr_mes_reasoning">${messageFormatting(substituteParams(block.content), '', false, false, messageId, {}, true)}</div>
 
             `;
             multiContainer.appendChild(details);
