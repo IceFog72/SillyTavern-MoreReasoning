@@ -884,7 +884,7 @@ function patchReasoning() {
 
         const details = $(this).closest('.more-reasoning-details');
         const messageBlock = details.closest('.mes');
-        const messageId = messageBlock.attr('mesid');
+        const messageId = Number(messageBlock.attr('mesid'));
         const message = chat[messageId];
         const parserId = details.attr('data-parser-id');
 
@@ -933,7 +933,7 @@ function patchReasoning() {
 
         const details = $(this).closest('.more-reasoning-details');
         const messageBlock = details.closest('.mes');
-        const messageId = messageBlock.attr('mesid');
+        const messageId = Number(messageBlock.attr('mesid'));
         const message = chat[messageId];
         const parserId = details.attr('data-parser-id');
 
@@ -946,6 +946,8 @@ function patchReasoning() {
 
         if (block.content !== newContent) {
             block.content = newContent;
+            // Update expandedContent so the UI reflects the change
+            block.expandedContent = substituteParams(newContent);
             // Native MESSAGE_UPDATED event triggers saves downstream
             await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
         }
