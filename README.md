@@ -6,7 +6,7 @@ A SillyTavern extension that expands the built-in reasoning system to support **
 
 SillyTavern's native reasoning feature handles a single reasoning block per message (typically `<think>...`). MoreReasoning lets you:
 
-- **Define multiple parsers** — each with its own prefix/suffix tags (e.g. `<think>`/`, `<plan>`/`</plan>`)
+- **Define multiple parsers** — each with its own prefix/suffix tags (e.g. `<think>`/`</think>`, `<plan>`/`</plan>`)
 - **Control prompt injection per parser** — set how many of the most recent blocks each parser sends to the model (0 = never send, 1+ = send last N)
 - **Auto-parse** — automatically detect and extract reasoning blocks from streamed or historical messages
 - **Auto-expand** — choose which parsers' blocks open by default in the chat UI
@@ -16,7 +16,7 @@ SillyTavern's native reasoning feature handles a single reasoning block per mess
 
 1. **Extraction** — When a message is received (streaming or loaded from history), the extension scans for configured tag pairs and stores the content in `message.extra.reasoning_blocks`.
 2. **Display** — Raw tags are hidden from the chat bubble. Each block appears as a collapsible `<details>` panel styled to match SillyTavern's native reasoning UI.
-3. **Prompt filtering** — During prompt construction, blocks are kept or stripped based on each parser's "Max" setting, counting backwards from the newest message. Tags always remain in `message.mes` so the chat history stays intact.
+3. **Prompt filtering** — During prompt construction, blocks are rebuilt from `message.extra.reasoning_blocks` based on each parser's "Max" setting, counting backwards from the newest message. The visible message text stays clean, and tags are added only to the prompt when eligible.
 
 ## Configuration
 
@@ -32,7 +32,7 @@ Open **Settings → Reasoning** and scroll to the **More Reasoning Parsers** sec
 | **Auto-Parse** | Automatically detect this parser's tags in messages |
 | **Auto-Expand** | Open this parser's reasoning blocks by default |
 | **Add to Prompts** | Whether this parser's blocks are eligible for prompt injection |
-| **Show Hidden** | Show reasoning time/duration even when content is hidden |
+| **Show Hidden** | Show empty/hidden reasoning blocks for this parser instead of suppressing them |
 
 Two parsers are included by default:
 - **Thought** (`<think>` / `</think>`) — Max 0 (not sent to prompt)
@@ -41,7 +41,7 @@ Two parsers are included by default:
 ## Default Parsers
 
 ```
-Thought:  <think> ...  ๛  (Max: 0 — parsed but excluded from prompts)
+Thought:  <think> ... </think>  (Max: 0 — parsed but excluded from prompts)
 Plan:     <plan> ... </plan>  (Max: 1 — last block included in prompts)
 ```
 

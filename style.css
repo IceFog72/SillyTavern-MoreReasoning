@@ -36,6 +36,11 @@
     margin-bottom: 0;
 }
 
+.more-reasoning-details[data-state="hidden"] .mes_reasoning_arrow,
+.more-reasoning-details[data-state="hidden"] .mr_mes_reasoning {
+    display: none;
+}
+
 /* Use native header class for ST styling */
 .more-reasoning-details .mes_reasoning_header {
     cursor: pointer;

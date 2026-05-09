@@ -1,7 +1,5 @@
-import { chat, eventSource, event_types, saveSettingsDebounced, substituteParams, messageFormatting } from '../../../../script.js';
-import { power_user } from '../../../power-user.js';
-import { ReasoningHandler, PromptReasoning, ReasoningType, ReasoningState } from '../../../reasoning.js';
-import { trimSpaces, setDatasetProperty } from '../../../utils.js';
+import { chat, eventSource, event_types, saveChatDebounced, saveSettingsDebounced, substituteParams, messageFormatting } from '../../../../script.js';
+import { ReasoningHandler, PromptReasoning, ReasoningState } from '../../../reasoning.js';
 import { extension_settings } from '../../../extensions.js';
 
 const MODULE_NAME = 'MoreReasoning';
@@ -16,10 +14,6 @@ function generateUUID() {
     return 'parser_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9) + '_' + Math.random().toString(36).substr(2, 9);
 }
 
-function escapeRegex(string) {
-    return string.replace(/[/\-\\^$*+?.()|[\]{}]/g, '\\$&');
-}
-
 /**
  * @typedef {object} MoreReasoningParser
  * @property {string} id - Unique identifier
@@ -31,7 +25,7 @@ function escapeRegex(string) {
  * @property {boolean} enabled - Whether it's active
  * @property {boolean} autoExpand - Whether to auto-expand in UI
  * @property {boolean} addToPrompts - Whether to add to prompts
- * @property {boolean} showHidden - Whether to show hidden reasoning time
+ * @property {boolean} showHidden - Whether to show empty/hidden reasoning blocks
  */
 
 const defaultSettings = {
@@ -167,52 +161,52 @@ function renderParsers() {
         const itemHtml = `
             <div class="more-reasoning-parser-item" data-index="${index}">
                 <div class="flex-container alignItemsBaseline">
-                    <input class="mr-name text_pole flex1" type="text" value="${parser.name}" placeholder="Parser Name">
+                    <input class="mr-name text_pole flex1" type="text" placeholder="Parser Name">
                     <div class="mr-delete menu_button fa-solid fa-trash-can" title="Delete parser"></div>
                 </div>
 
                 <div class="flex-container alignItemsBaseline">
                     <label class="checkbox_label flex1" title="Automatically parse reasoning blocks from main content.">
-                        <input class="mr-enabled" type="checkbox" ${parser.enabled ? 'checked' : ''}>
+                        <input class="mr-enabled" type="checkbox">
                         <small>Auto-Parse</small>
                     </label>
                     <label class="checkbox_label flex1" title="Automatically expand reasoning blocks for this parser.">
-                        <input class="mr-expand" type="checkbox" ${parser.autoExpand ? 'checked' : ''}>
+                        <input class="mr-expand" type="checkbox">
                         <small>Auto-Expand</small>
                     </label>
-                    <label class="checkbox_label flex1" title="Show reasoning time/blocks even if content is hidden.">
-                        <input class="mr-show-hidden" type="checkbox" ${parser.showHidden ? 'checked' : ''}>
+                    <label class="checkbox_label flex1" title="Show empty/hidden reasoning blocks for this parser.">
+                        <input class="mr-show-hidden" type="checkbox">
                         <small>Show Hidden</small>
                     </label>
                 </div>
 
                 <div class="flex-container alignItemsBaseline">
                     <label class="checkbox_label flex1" title="Add existing reasoning blocks for this parser to prompts.">
-                        <input class="mr-add-to-prompts" type="checkbox" ${parser.addToPrompts ? 'checked' : ''}>
+                        <input class="mr-add-to-prompts" type="checkbox">
                         <small>Add to Prompts</small>
                     </label>
                     <div class="flex1 flex-container alignItemsBaseline" title="Maximum number of reasoning blocks to be added per prompt for this parser.">
-                        <input class="mr-max text_pole textarea_compact widthUnset" type="number" value="${parser.maxAdditions}" min="0" max="999">
+                        <input class="mr-max text_pole textarea_compact widthUnset" type="number" min="0" max="999">
                         <small>Max</small>
                     </div>
                 </div>
 
                 <details open>
-                    <summary>Formatting (${parser.name})</summary>
+                    <summary></summary>
                     <div class="flex-container">
                         <div class="flex1" title="Inserted before the reasoning content.">
                             <small>Prefix</small>
-                            <textarea class="mr-prefix text_pole textarea_compact autoSetHeight" spellcheck="false">${parser.prefix}</textarea>
+                            <textarea class="mr-prefix text_pole textarea_compact autoSetHeight" spellcheck="false"></textarea>
                         </div>
                         <div class="flex1" title="Inserted after the reasoning content.">
                             <small>Suffix</small>
-                            <textarea class="mr-suffix text_pole textarea_compact autoSetHeight" spellcheck="false">${parser.suffix}</textarea>
+                            <textarea class="mr-suffix text_pole textarea_compact autoSetHeight" spellcheck="false"></textarea>
                         </div>
                     </div>
                     <div class="flex-container">
                         <div class="flex1" title="Inserted between the reasoning and the message content.">
                             <small>Separator</small>
-                            <textarea class="mr-separator text_pole textarea_compact autoSetHeight" spellcheck="false">${parser.separator}</textarea>
+                            <textarea class="mr-separator text_pole textarea_compact autoSetHeight" spellcheck="false"></textarea>
                         </div>
                     </div>
                 </details>
@@ -220,14 +214,25 @@ function renderParsers() {
         `;
         const $item = $(itemHtml);
 
-        $item.find('.mr-name').on('input', function () { parser.name = $(this).val(); $item.find('summary').text(`Formatting (${parser.name})`); saveSettings(); });
+        $item.find('.mr-name').val(parser.name);
+        $item.find('.mr-enabled').prop('checked', parser.enabled);
+        $item.find('.mr-expand').prop('checked', parser.autoExpand);
+        $item.find('.mr-show-hidden').prop('checked', parser.showHidden);
+        $item.find('.mr-add-to-prompts').prop('checked', parser.addToPrompts);
+        $item.find('.mr-max').val(parser.maxAdditions);
+        $item.find('.mr-prefix').val(parser.prefix);
+        $item.find('.mr-suffix').val(parser.suffix);
+        $item.find('.mr-separator').val(parser.separator);
+        $item.find('summary').text(`Formatting (${parser.name})`);
+
+        $item.find('.mr-name').on('input', function () { parser.name = String($(this).val()); $item.find('summary').text(`Formatting (${parser.name})`); saveSettings(); });
         $item.find('.mr-enabled').on('change', function () { parser.enabled = $(this).prop('checked'); saveSettings(); });
         $item.find('.mr-expand').on('change', function () { parser.autoExpand = $(this).prop('checked'); saveSettings(); });
         $item.find('.mr-add-to-prompts').on('change', function () { parser.addToPrompts = $(this).prop('checked'); saveSettings(); });
         $item.find('.mr-show-hidden').on('change', function () { parser.showHidden = $(this).prop('checked'); saveSettings(); });
-        $item.find('.mr-prefix').on('input', function () { parser.prefix = $(this).val(); saveSettings(); });
-        $item.find('.mr-suffix').on('input', function () { parser.suffix = $(this).val(); saveSettings(); });
-        $item.find('.mr-separator').on('input', function () { parser.separator = $(this).val(); saveSettings(); });
+        $item.find('.mr-prefix').on('input', function () { parser.prefix = String($(this).val()); saveSettings(); });
+        $item.find('.mr-suffix').on('input', function () { parser.suffix = String($(this).val()); saveSettings(); });
+        $item.find('.mr-separator').on('input', function () { parser.separator = String($(this).val()); saveSettings(); });
         $item.find('.mr-max').on('input', function () { parser.maxAdditions = parseInt($(this).val()) || 0; saveSettings(); });
         $item.find('.mr-delete').on('click', () => {
             if (confirm(`Delete parser "${parser.name}"?`)) {
@@ -439,7 +444,8 @@ function patchReasoning() {
                     let isNested = false;
                     for (const otherParser of activeParsers) {
                         if (otherParser.id === matchedParser.id) continue;
-                        const otherStartPos = workingContent.lastIndexOf(otherParser.prefix, earliestPrefix);
+                        // Correctly detect if we are strictly inside another parser's tags
+                        const otherStartPos = workingContent.lastIndexOf(otherParser.prefix, Math.max(0, earliestPrefix - 1));
                         if (otherStartPos !== -1) {
                             const otherSuffixPos = workingContent.indexOf(otherParser.suffix, earliestPrefix);
                             if (otherSuffixPos !== -1 && otherSuffixPos > earliestPrefix) {
@@ -563,26 +569,44 @@ function patchReasoning() {
     // prematurely when custom blocks on newer messages fill their limits,
     // preventing native reasoning on older messages from being added.
     // =========================================================================
+    const ensureInitialized = (instance) => {
+        if (instance._mr_initialized) return;
+        instance._mr_initialized = true;
+        instance._mr_seenTotal = {};  // Global counter: total blocks added per parser
+        instance._mr_completedCount = {};  // Track complete blocks added per parser
+        settings.parsers.forEach(p => {
+            instance._mr_seenTotal[p.id] = 0;
+            instance._mr_completedCount[p.id] = 0;
+        });
+        // Sequence mirrors coreChat: non-system messages, newest first
+        instance._mr_sequence = chat.filter(m => !m.is_system).reverse();
+        instance._mr_cursor = 0; // addToMessage reads first; isLimitReached advances after each ST loop item
+    };
+
     const originalIsLimitReached = PromptReasoning.prototype.isLimitReached;
     PromptReasoning.prototype.isLimitReached = function () {
+        ensureInitialized(this);
+
+        // Advance cursor for history synchronization. ST calls addToMessage()
+        // before this method on each loop iteration.
+        this._mr_cursor++;
+
         // If native logic says we are not yet done, keep going
         if (!originalIsLimitReached.call(this)) {
             return false;
         }
         // Check if any of our custom parsers still need more blocks
-        // Track per-parser: have we added maxAdditions blocks across messages?
         const stillNeedsMore = settings.parsers.some(parser => {
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return false;
-            
+
             // Count total blocks added for this parser
-            const totalSeen = this._mr_seenTotal?.[parser.id] ?? 0;
-            
+            const totalSeen = this._mr_seenTotal[parser.id] ?? 0;
+
             // Keep the loop alive as long as we haven't reached maxAdditions yet
-            // OR until we've processed all messages
-            const hasMoreMessages = this._mr_cursor < (this._mr_sequence?.length ?? 0);
+            // AND we haven't processed all messages in the sequence
+            const hasMoreMessages = this._mr_cursor < this._mr_sequence.length;
             const stillNeedsBlocks = totalSeen < parser.maxAdditions;
-            
-            // Continue if we need more blocks AND have more messages to check
+
             return stillNeedsBlocks && hasMoreMessages;
         });
         // Return true (limit reached) ONLY when both native is done AND we don't need any more blocks
@@ -604,33 +628,17 @@ function patchReasoning() {
     // =========================================================================
     const originalAddToMessage = PromptReasoning.prototype.addToMessage;
     PromptReasoning.prototype.addToMessage = function (content, reasoning, isPrefix, duration) {
-        // Per-instance state — reset each generation (new PromptReasoning() each time)
-        if (!this._mr_initialized) {
-            this._mr_initialized = true;
-            this._mr_seenTotal = {};  // Global counter: total blocks added per parser
-            this._mr_completedCount = {};  // Track complete blocks added per parser
-            settings.parsers.forEach(p => { 
-                this._mr_seenTotal[p.id] = 0;
-                this._mr_completedCount[p.id] = 0;
-            });
-            // Sequence mirrors coreChat: non-system messages, newest first
-            this._mr_sequence = chat.filter(m => !m.is_system).reverse();
-            this._mr_cursor = 0;
-        }
+        ensureInitialized(this);
 
         // Call original to get native reasoning (prepended to content)
         let finalContent = originalAddToMessage.call(this, content, reasoning, isPrefix, duration);
 
-        // Advance cursor to pick up this message's reasoning_blocks.
-        // isPrefix = true means the actively-streaming last message —
-        // don't advance so the cursor stays in sync for future calls.
-        const currentMessage = this._mr_sequence[this._mr_cursor];
+        // Use index 0 for the active generation prefix, otherwise use the history cursor.
+        // The cursor advances in isLimitReached after this call, matching ST's loop.
+        const currentMessage = isPrefix ? this._mr_sequence[0] : this._mr_sequence[this._mr_cursor];
         if (!currentMessage?.extra?.reasoning_blocks?.length) {
-            if (!isPrefix) this._mr_cursor++;
             return finalContent;
         }
-
-        if (!isPrefix) this._mr_cursor++;
 
         // Build the injection string from blocks according to parser settings
         // Track which parsers have added a complete block from THIS message
@@ -833,6 +841,7 @@ function patchReasoning() {
             const parser = getParser(block.parserId);
             if (!parser) return;
             if (!parser.enabled) return; // parser disabled — don't show its blocks
+            if (!parser.showHidden && !String(block.content ?? '').trim()) return;
 
             const details = document.createElement('details');
             // 'mes_reasoning_details' for ST CSS styling,
@@ -844,29 +853,45 @@ function patchReasoning() {
             details.id = `parser_${cleanTag}_${messageId}_${blockIndex}`;
 
             details.dataset.parserId = parser.id; // required for editing
-            if (block.incomplete) details.dataset.state = 'thinking';
+            details.dataset.blockIndex = String(blockIndex);
+            const isHiddenBlock = !String(block.content ?? '').trim();
+            if (isHiddenBlock) details.dataset.state = 'hidden';
+            else if (block.incomplete) details.dataset.state = 'thinking';
             if (parser.autoExpand || block.incomplete) details.open = true;
 
-            const headerTitle = block.incomplete ? `${parser.name} (Thinking...)` : parser.name;
+            const headerTitle = isHiddenBlock ? `${parser.name} (Hidden)` : block.incomplete ? `${parser.name} (Thinking...)` : parser.name;
 
             // Add custom reasoning actions with edit buttons
-            details.innerHTML = `
-                <summary class="mes_reasoning_summary flex-container">
-                    <div class="mes_reasoning_header_block mr_mes_reasoning_header_block flex-container">
-                        <div class="mes_reasoning_header mr_mes_reasoning_header flex-container">
-                            <span class="mes_reasoning_header_title">${headerTitle}</span>
-                            <div class="mes_reasoning_arrow fa-solid fa-chevron-up"></div>
-                        </div>
-                    </div>
-                    <div class="mes_reasoning_actions flex-direction-row flex-container mr_mes_reasoning_actions" style="margin-top: 5px;">
-                        <div class="mr_mes_reasoning_edit_done menu_button edit_button fa-solid fa-check" title="Confirm" style="display:none"></div>
-                        <div class="mr_mes_reasoning_edit_cancel menu_button edit_button fa-solid fa-xmark" title="Cancel edit" style="display:none"></div>
-                        <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
-                    </div>
-                </summary>
-                <div class="mr_mes_reasoning">${messageFormatting(block.expandedContent || substituteParams(block.content), '', false, false, messageId, {}, true)}</div>
+            const summary = document.createElement('summary');
+            summary.className = 'mes_reasoning_summary flex-container';
+            const headerBlock = document.createElement('div');
+            headerBlock.className = 'mes_reasoning_header_block mr_mes_reasoning_header_block flex-container';
+            const header = document.createElement('div');
+            header.className = 'mes_reasoning_header mr_mes_reasoning_header flex-container';
+            const title = document.createElement('span');
+            title.className = 'mes_reasoning_header_title';
+            title.textContent = headerTitle;
+            const arrow = document.createElement('div');
+            arrow.className = 'mes_reasoning_arrow fa-solid fa-chevron-up';
+            header.append(title, arrow);
+            headerBlock.append(header);
 
+            const actions = document.createElement('div');
+            actions.className = 'mes_reasoning_actions flex-direction-row flex-container mr_mes_reasoning_actions';
+            actions.style.marginTop = '5px';
+            actions.innerHTML = `
+                <div class="mr_mes_reasoning_edit_done menu_button edit_button fa-solid fa-check" title="Confirm" style="display:none"></div>
+                <div class="mr_mes_reasoning_edit_cancel menu_button edit_button fa-solid fa-xmark" title="Cancel edit" style="display:none"></div>
+                <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
             `;
+            summary.append(headerBlock, actions);
+
+            const content = document.createElement('div');
+            content.className = 'mr_mes_reasoning';
+            if (!isHiddenBlock) {
+                content.innerHTML = messageFormatting(block.expandedContent || substituteParams(block.content), '', false, false, messageId, {}, true);
+            }
+            details.append(summary, content);
             multiContainer.appendChild(details);
         });
 
@@ -887,10 +912,11 @@ function patchReasoning() {
         const messageId = Number(messageBlock.attr('mesid'));
         const message = chat[messageId];
         const parserId = details.attr('data-parser-id');
+        const blockIndex = Number(details.attr('data-block-index'));
 
         if (!message || !message.extra?.reasoning_blocks) return;
-        const block = message.extra.reasoning_blocks.find(b => b.parserId === parserId);
-        if (!block) return;
+        const block = message.extra.reasoning_blocks[blockIndex];
+        if (!block || block.parserId !== parserId) return;
 
         const reasoningBlock = details.find('.mr_mes_reasoning');
         const textarea = document.createElement('textarea');
@@ -936,10 +962,11 @@ function patchReasoning() {
         const messageId = Number(messageBlock.attr('mesid'));
         const message = chat[messageId];
         const parserId = details.attr('data-parser-id');
+        const blockIndex = Number(details.attr('data-block-index'));
 
         if (!message || !message.extra?.reasoning_blocks) return;
-        const block = message.extra.reasoning_blocks.find(b => b.parserId === parserId);
-        if (!block) return;
+        const block = message.extra.reasoning_blocks[blockIndex];
+        if (!block || block.parserId !== parserId) return;
 
         const textarea = details.find('.mr_reasoning_edit_textarea');
         const newContent = String(textarea.val());
@@ -948,7 +975,7 @@ function patchReasoning() {
             block.content = newContent;
             // Update expandedContent so the UI reflects the change
             block.expandedContent = substituteParams(newContent);
-            // Native MESSAGE_UPDATED event triggers saves downstream
+            saveChatDebounced();
             await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
         }
 
