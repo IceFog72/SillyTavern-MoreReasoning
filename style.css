@@ -41,6 +41,7 @@
     display: none;
 }
 
+
 /* Use native header class for ST styling */
 .more-reasoning-details .mes_reasoning_header {
     cursor: pointer;
@@ -54,6 +55,17 @@
     background-color: var(--grey30);
     font-size: calc(var(--mainFontSize) * 0.9);
     align-items: baseline;
+}
+
+.more-reasoning-details .mes_reasoning_arrow {
+    position: absolute;
+    top: 50%;
+    right: 7px;
+    transform: translateY(-50%);
+    font-size: calc(var(--mainFontSize) * 0.7);
+    width: calc(var(--mainFontSize) * 0.7);
+    height: calc(var(--mainFontSize) * 0.7);
+    display: block !important;
 }
 
 

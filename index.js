@@ -91,6 +91,11 @@ function loadSettings() {
                 ...parser,
                 id: finalId,
             };
+        }).filter(parser => {
+            // Allow empty parsers (user is still editing)
+            if (!parser.prefix && !parser.suffix) return true;
+            // Filter out invalid parsers (missing prefix/suffix or identical)
+            return isValidParser(parser);
         });
     } else {
         // No user parsers, use defaults with proper defaults applied
@@ -269,6 +274,15 @@ function getParser(id) {
     return parser;
 }
 
+/**
+ * Check if a parser has valid prefix/suffix tags.
+ * @param {MoreReasoningParser} parser
+ * @returns {boolean}
+ */
+function isValidParser(parser) {
+    return parser && parser.prefix && parser.suffix && parser.prefix !== parser.suffix;
+}
+
 // =========================================================================
 // Non-destructive reparse.
 //
@@ -287,37 +301,41 @@ function getParser(id) {
 //    Skip — nothing to do.
 // =========================================================================
 async function reparseAllMessages() {
-    console.log(`[${MODULE_NAME}] Reparsing all messages for reasoning blocks...`);
-    let processedCount = 0;
+    try {
+        console.log(`[${MODULE_NAME}] Reparsing all messages for reasoning blocks...`);
+        let processedCount = 0;
 
-    for (let i = 0; i < chat.length; i++) {
-        const message = chat[i];
-        if (!message || message.is_user) continue;
+        for (let i = 0; i < chat.length; i++) {
+            const message = chat[i];
+            if (!message || message.is_user) continue;
 
-        // Case 1: Already parsed — strip any legacy tags from message.mes,
-        // then refresh the DOM from the stored reasoning_blocks.
-        if (message.extra?.reasoning_blocks?.length) {
-            _stripTagsFromMes(message);
-            const handler = new ReasoningHandler();
-            handler._mr_isReparsing = true;
-            handler.updateDom(i);
-            processedCount++;
-            continue;
+            // Case 1: Already parsed — strip any legacy tags from message.mes,
+            // then refresh the DOM from the stored reasoning_blocks.
+            if (message.extra?.reasoning_blocks?.length) {
+                _stripTagsFromMes(message);
+                const handler = new ReasoningHandler();
+                handler._mr_isReparsing = true;
+                handler.updateDom(i);
+                processedCount++;
+                continue;
+            }
+
+            // Case 2: Raw tags still in message.mes — run full process()
+            const hasCustomTags = settings.parsers.some(
+                p => p.enabled && isValidParser(p) && message.mes.includes(p.prefix),
+            );
+            if (hasCustomTags) {
+                const handler = new ReasoningHandler();
+                handler._mr_isReparsing = true;
+                await handler.process(i, false);
+                processedCount++;
+            }
         }
 
-        // Case 2: Raw tags still in message.mes — run full process()
-        const hasCustomTags = settings.parsers.some(
-            p => p.enabled && p.prefix && p.suffix && message.mes.includes(p.prefix),
-        );
-        if (hasCustomTags) {
-            const handler = new ReasoningHandler();
-            handler._mr_isReparsing = true;
-            await handler.process(i, false);
-            processedCount++;
-        }
+        console.log(`[${MODULE_NAME}] Reparsed ${processedCount} messages`);
+    } catch (e) {
+        console.error(`[${MODULE_NAME}] Error reparsing messages:`, e);
     }
-
-    console.log(`[${MODULE_NAME}] Reparsed ${processedCount} messages`);
 }
 
 /**
@@ -333,7 +351,7 @@ function _stripTagsFromMes(message) {
 
     for (const block of message.extra.reasoning_blocks) {
         const parser = getParser(block.parserId);
-        if (!parser || !parser.prefix || !parser.suffix) continue;
+        if (!parser || !isValidParser(parser)) continue;
 
         const fullTag = block.incomplete
             ? parser.prefix + block.content
@@ -413,7 +431,7 @@ function patchReasoning() {
 
         if (!message.extra) message.extra = {};
 
-        const activeParsers = settings.parsers.filter(p => p.enabled && p.prefix && p.suffix);
+        const activeParsers = settings.parsers.filter(p => p.enabled && isValidParser(p));
 
         // Detect custom tags BEFORE the original handler runs.
         // The original handler returns early if !this.reasoning && !isHiddenReasoningModel,
@@ -646,7 +664,7 @@ function patchReasoning() {
         let injection = '';
         currentMessage.extra.reasoning_blocks.forEach(block => {
             const parser = getParser(block.parserId);
-            if (!parser || !parser.prefix || !parser.suffix) return;
+            if (!parser || !isValidParser(parser)) return;
             if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return;
 
             const isComplete = !block.incomplete;
@@ -755,12 +773,18 @@ function patchReasoning() {
         const applyVisualHider = () => {
             if (!mesText || !message.extra?.reasoning_blocks?.length) return;
 
+            // Ensure observer exists (created once, persists until chat change)
+            if (!mesText._mrObserver) {
+                mesText._mrObserver = new MutationObserver(() => applyVisualHider());
+                mesText._mrObserver.observe(mesText, { childList: true, characterData: true, subtree: true });
+            }
+
             let displayMes = message.mes;
             let stripped = false;
 
             message.extra.reasoning_blocks.forEach(block => {
                 const parser = getParser(block.parserId);
-                if (parser && parser.prefix && parser.suffix) {
+                if (parser && isValidParser(parser)) {
                     const suffixToUse = block.incomplete ? '' : parser.suffix;
                     const exactString = parser.prefix + block.content + suffixToUse;
                     if (displayMes.includes(exactString)) {
@@ -771,10 +795,6 @@ function patchReasoning() {
             });
 
             if (stripped) {
-                if (mesText._mrObserver) {
-                    mesText._mrObserver.disconnect();
-                    mesText._mrObserver = null;
-                }
                 mesText.innerHTML = messageFormatting(
                     displayMes.trim(),
                     message.name,
@@ -782,17 +802,8 @@ function patchReasoning() {
                     message.is_user,
                     messageId
                 );
-                if (!mesText._mrObserver) {
-                    mesText._mrObserver = new MutationObserver(() => applyVisualHider());
-                    mesText._mrObserver.observe(mesText, { childList: true, characterData: true, subtree: true });
-                }
             }
         };
-
-        if (mesText && !mesText._mrObserver) {
-            mesText._mrObserver = new MutationObserver(() => applyVisualHider());
-            mesText._mrObserver.observe(mesText, { childList: true, characterData: true, subtree: true });
-        }
         applyVisualHider();
 
         // Hide custom container if the handler was reset (e.g., during swiping animation)
@@ -984,6 +995,24 @@ function patchReasoning() {
         handler.updateDom(messageId);
     });
 
+    // Override click handler for custom reasoning headers
+    // SillyTavern's default handler targets .mes_reasoning_header but doesn't
+    // work for our custom <details> elements — we need to toggle manually.
+    $(document).on('click', '.more-reasoning-details .mes_reasoning_header', function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+
+        const details = $(this).closest('.more-reasoning-details');
+        if (details.length) {
+            // Toggle the open attribute
+            if (details[0].hasAttribute('open')) {
+                details[0].removeAttribute('open');
+            } else {
+                details[0].setAttribute('open', '');
+            }
+        }
+    });
+
     console.log(`[${MODULE_NAME}] Patching complete.`);
 }
 
@@ -992,42 +1021,54 @@ eventSource.on(event_types.APP_READY, () => {
 });
 
 async function checkAndParseMessage(messageId, forceReset = false) {
-    const message = chat[messageId];
-    if (!message || message.is_user) return;
+    try {
+        const message = chat[messageId];
+        if (!message || message.is_user) return;
 
-    // Check if this message actually has raw tags that need parsing first
-    const hasRawTags = settings.parsers.some(
-        p => p.enabled && p.prefix && p.suffix && message.mes.includes(p.prefix),
-    );
+        // Check if this message actually has raw tags that need parsing first
+        const hasRawTags = settings.parsers.some(
+            p => p.enabled && isValidParser(p) && message.mes.includes(p.prefix),
+        );
 
-    // Also check if this is a fresh overswipe starting (SillyTavern sets mes to '...')
-    const isNewGeneration = message.mes === '...';
+        // Also check if this is a fresh overswipe starting (SillyTavern sets mes to '...')
+        const isNewGeneration = message.mes === '...';
 
-    // Clear existing blocks if:
-    // 1. Force reset (e.g., manually triggered refreshing), OR
-    // 2. New raw tags detected (needs re-parsing), OR
-    // 3. New generation starting (to clear stale blocks from copied variant)
-    if ((forceReset || hasRawTags || isNewGeneration) && message.extra) {
-        delete message.extra.reasoning_blocks;
-        delete message.extra.mr_has_custom_blocks;
+        // Clear existing blocks if:
+        // 1. Force reset (e.g., manually triggered refreshing), OR
+        // 2. New raw tags detected (needs re-parsing), OR
+        // 3. New generation starting (to clear stale blocks from copied variant)
+        if ((forceReset || hasRawTags || isNewGeneration) && message.extra) {
+            delete message.extra.reasoning_blocks;
+            delete message.extra.mr_has_custom_blocks;
+        }
+
+        const handler = new ReasoningHandler();
+        handler._mr_isReparsing = true;
+        await handler.process(messageId, false);
+    } catch (e) {
+        console.error(`[${MODULE_NAME}] Error parsing message ${messageId}:`, e);
     }
-
-    const handler = new ReasoningHandler();
-    handler._mr_isReparsing = true;
-    await handler.process(messageId, false);
 }
 
 // Catch messages from non-streamed inference and swipes.
 eventSource.on(event_types.MESSAGE_RECEIVED, async (messageId) => {
-    await checkAndParseMessage(messageId);
+    try {
+        await checkAndParseMessage(messageId);
+    } catch (e) {
+        console.error(`[${MODULE_NAME}] Error handling MESSAGE_RECEIVED:`, e);
+    }
 });
 
 eventSource.on(event_types.MESSAGE_SWIPED, async (messageId) => {
-    // DO NOT force reset here anymore.
-    // If it's a new generation, checkAndParseMessage will detect '...' and clear.
-    // If it's a return to an old swipe, ST core has already restored the 'extra' data,
-    // and we want to preserve it rather than clearing it unconditionally.
-    await checkAndParseMessage(messageId, false);
+    try {
+        // DO NOT force reset here anymore.
+        // If it's a new generation, checkAndParseMessage will detect '...' and clear.
+        // If it's a return to an old swipe, ST core has already restored the 'extra' data,
+        // and we want to preserve it rather than clearing it unconditionally.
+        await checkAndParseMessage(messageId, false);
+    } catch (e) {
+        console.error(`[${MODULE_NAME}] Error handling MESSAGE_SWIPED:`, e);
+    }
 });
 // Catch tags added during message edits
 let _mr_handlingMessageUpdate = false;
@@ -1037,6 +1078,8 @@ eventSource.on(event_types.MESSAGE_UPDATED, async (messageId) => {
     _mr_handlingMessageUpdate = true;
     try {
         await checkAndParseMessage(messageId);
+    } catch (e) {
+        console.error(`[${MODULE_NAME}] Error handling MESSAGE_UPDATED:`, e);
     } finally {
         _mr_handlingMessageUpdate = false;
     }
