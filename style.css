@@ -114,3 +114,24 @@
     opacity: 1;
     transform: scale(1.1);
 }
+
+/* Keep custom reasoning edit controls visually consistent with message actions. */
+.more-reasoning-details .mr_mes_reasoning_actions .edit_button {
+    cursor: pointer;
+    transition: opacity var(--animation-duration-2x) ease-in-out;
+    filter: drop-shadow(0px 0px 2px black);
+    opacity: 0.3;
+    padding: 1px 3px;
+    font-size: inherit;
+    height: auto;
+    margin: 0;
+    aspect-ratio: auto;
+    display: block;
+    background: transparent;
+    border: 0;
+}
+
+.more-reasoning-details .mr_mes_reasoning_actions .edit_button:hover {
+    opacity: 1;
+    filter: drop-shadow(0px 0px 2px black);
+}

@@ -1,62 +1,72 @@
 # MoreReasoning
 
-A SillyTavern extension that expands the built-in reasoning system to support **multiple independent reasoning parsers** — for example `<think>`, `<plan>`, `<reflection>`, or any custom tag pair you define.
+A SillyTavern extension that adds **multiple independent reasoning parsers** alongside SillyTavern's native reasoning support. Define tag pairs such as `<think>...</think>`, `<plan>...</plan>`, `<reflection>...</reflection>`, or your own formats.
 
-## What It Does
+## Features
 
-SillyTavern's native reasoning feature handles a single reasoning block per message (typically `<think>...`). MoreReasoning lets you:
-
-- **Define multiple parsers** — each with its own prefix/suffix tags (e.g. `<think>`/`</think>`, `<plan>`/`</plan>`)
-- **Control prompt injection per parser** — set how many of the most recent blocks each parser sends to the model (0 = never send, 1+ = send last N)
-- **Auto-parse** — automatically detect and extract reasoning blocks from streamed or historical messages
-- **Auto-expand** — choose which parsers' blocks open by default in the chat UI
-- **Manage everything from the Settings panel** — add, edit, and delete parsers without touching code
-
-## How It Works
-
-1. **Extraction** — When a message is received (streaming or loaded from history), the extension scans for configured tag pairs and stores the content in `message.extra.reasoning_blocks`.
-2. **Display** — Raw tags are hidden from the chat bubble. Each block appears as a collapsible `<details>` panel styled to match SillyTavern's native reasoning UI.
-3. **Prompt filtering** — During prompt construction, blocks are rebuilt from `message.extra.reasoning_blocks` based on each parser's "Max" setting, counting backwards from the newest message. The visible message text stays clean, and tags are added only to the prompt when eligible.
+- Multiple independent custom reasoning parsers.
+- Streaming and historical-message extraction.
+- Per-parser prompt injection limits using the **most recent N blocks**.
+- Per-parser Auto-Parse, Auto-Expand, Add to Prompts, and Show Hidden controls.
+- Editable custom reasoning blocks in chat.
+- Stable parser IDs so changing a parser name/tag does not orphan stored blocks.
+- Parser validation for missing, duplicate, or overlapping prefixes.
+- Swipe-safe prompt injection using SillyTavern's generation interceptor.
+- Custom reasoning state is independent from SillyTavern's native `ReasoningHandler` state.
 
 ## Configuration
 
-Open **Settings → Reasoning** and scroll to the **More Reasoning Parsers** section.
+Open **Settings → Reasoning** and find **More Reasoning Parsers**.
 
 | Setting | Description |
-|---------|-------------|
-| **Name** | Display label for the parser |
-| **Prefix** | Opening tag (e.g. `<think>`) |
-| **Suffix** | Closing tag (e.g. `</think>`) |
-| **Separator** | Text inserted between reasoning and response when building prompts |
-| **Max** | Number of most-recent blocks to include in prompts (0 = exclude all) |
-| **Auto-Parse** | Automatically detect this parser's tags in messages |
-| **Auto-Expand** | Open this parser's reasoning blocks by default |
-| **Add to Prompts** | Whether this parser's blocks are eligible for prompt injection |
-| **Show Hidden** | Show empty/hidden reasoning blocks for this parser instead of suppressing them |
+|---|---|
+| **Name** | Display label for the parser. |
+| **Prefix** | Opening tag, for example `<plan>`. |
+| **Suffix** | Closing tag, for example `</plan>`. |
+| **Separator** | Text placed after an injected reasoning block before prompt message content. |
+| **Max** | Number of the most recent blocks for this parser to include in prompts. `0` disables prompt injection for that parser. |
+| **Auto-Parse** | Detect and extract this parser's tags from assistant messages. |
+| **Auto-Expand** | Open non-empty blocks by default in chat. |
+| **Add to Prompts** | Allow stored blocks from this parser to be injected into generation prompts. |
+| **Show Hidden** | Display empty/hidden blocks instead of suppressing them. |
 
-Two parsers are included by default:
-- **Thought** (`<think>` / `</think>`) — Max 0 (not sent to prompt)
-- **Plan** (`<plan>` / `</plan>`) — Max 1 (last block sent to prompt)
+Invalid or partially edited parsers stay saved but are disabled until their configuration becomes valid.
 
-## Default Parsers
+## Defaults
 
+- **Thought**: `<think>...</think>`, Max `0`.
+- **Plan**: `<plan>...</plan>`, Max `1`.
+
+## Architecture
+
+Custom blocks are stored in:
+
+```text
+message.extra.reasoning_blocks
 ```
-Thought:  <think> ... </think>  (Max: 0 — parsed but excluded from prompts)
-Plan:     <plan> ... </plan>  (Max: 1 — last block included in prompts)
+
+The visible `message.mes` remains free of custom reasoning tags. MoreReasoning does **not** create placeholder native reasoning or overwrite SillyTavern's `extra.reasoning` fields.
+
+Prompt injection happens through SillyTavern's `generate_interceptor` using the exact `coreChat` produced by SillyTavern. This keeps custom reasoning aligned with swipe generation, tool-call history filtering, group chats, and other core prompt preprocessing.
+
+## Compatibility
+
+- SillyTavern **1.18.0 or newer**.
+
+## Development
+
+The parsing and prompt-selection logic is isolated in `core.js` and covered by Node tests:
+
+```bash
+npm test
 ```
-
-## Requirements
-
-- SillyTavern
 
 ## License
 
-See the repository for license details.
+GNU GPL v3. See `LICENSE`.
 
 ## Feedback
 
-Join my Discord: [https://discord.gg/2tJcWeMjFQ](https://discord.gg/2tJcWeMjFQ)
-Or find me on the official SillyTavern Discord server.
+Discord: https://discord.gg/2tJcWeMjFQ
 
-Support me:
-[Patreon](https://www.patreon.com/cw/IceFog72)
+Support: https://www.patreon.com/cw/IceFog72

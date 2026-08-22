@@ -1,176 +1,377 @@
-import { chat, eventSource, event_types, saveChatDebounced, saveSettingsDebounced, substituteParams, messageFormatting } from '../../../../script.js';
-import { ReasoningHandler, PromptReasoning, ReasoningState } from '../../../reasoning.js';
+import {
+    chat,
+    eventSource,
+    event_types,
+    messageFormatting,
+    name2,
+    saveChatDebounced,
+    saveSettingsDebounced,
+    substituteParams,
+    syncMesToSwipe,
+} from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
+import { selected_group } from '../../../group-chats.js';
+import { ReasoningHandler } from '../../../reasoning.js';
+import {
+    DEFAULT_SETTINGS,
+    PARSER_DEFAULTS,
+    buildPromptInjection,
+    createParserId,
+    extractReasoningBlocks,
+    getActiveParsers,
+    getParserValidationError,
+    mergeReasoningBlocks,
+    normalizeMaxAdditions,
+    normalizeSettings,
+    selectPromptBlocks,
+} from './core.js';
 
 const MODULE_NAME = 'MoreReasoning';
+const GENERATE_INTERCEPTOR_KEY = 'MoreReasoning_generateInterceptor';
+const PROCESS_PATCH_FLAG = Symbol.for('SillyTavern.MoreReasoning.processPatch.v3');
+const SCAN_DEBOUNCE_MS = 350;
 
-const PARSER_DEFAULTS = {
-    id: '', name: 'Parser', prefix: '', suffix: '', separator: '\n\n',
-    maxAdditions: 1, enabled: true, autoExpand: false,
-    addToPrompts: true, showHidden: true,
-};
-
-function generateUUID() {
-    return 'parser_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9) + '_' + Math.random().toString(36).substr(2, 9);
-}
+/** @type {{settingsVersion:number, parsers:Array<any>}|null} */
+let settings = null;
+let initialized = false;
+let scanTimer = null;
 
 /**
- * @typedef {object} MoreReasoningParser
- * @property {string} id - Unique identifier
- * @property {string} name - Display name
- * @property {string} prefix - Opening tag e.g. <think>
- * @property {string} suffix - Closing tag e.g. </think>
- * @property {string} separator - Separator e.g. \n\n
- * @property {number} maxAdditions - Max blocks to send to prompt
- * @property {boolean} enabled - Whether it's active
- * @property {boolean} autoExpand - Whether to auto-expand in UI
- * @property {boolean} addToPrompts - Whether to add to prompts
- * @property {boolean} showHidden - Whether to show empty/hidden reasoning blocks
+ * State needed only while a `continue` generation is active. It lets custom
+ * incomplete blocks continue without manufacturing native ReasoningHandler state.
+ * @type {null|{type:string,messageId:number,baseClean:string,baseBlocks:Array<any>,continuingBlockIndex:number}}
  */
+let generationState = null;
 
-const defaultSettings = {
-    parsers: [
-        {
-            id: 'think',
-            name: 'Thought',
-            prefix: '<think>',
-            suffix: '</think>',
-            separator: '\n\n',
-            maxAdditions: 0,
-            enabled: true,
-            autoExpand: false,
-            addToPrompts: true,
-            showHidden: true,
-        },
-        {
-            id: 'plan',
-            name: 'Plan',
-            prefix: '<plan>',
-            suffix: '</plan>',
-            separator: '\n\n',
-            maxAdditions: 1,
-            enabled: true,
-            autoExpand: false,
-            addToPrompts: true,
-            showHidden: true,
-        }
-    ]
-};
-
-/** @type {typeof defaultSettings} */
-let settings;
+function clone(value) {
+    return typeof structuredClone === 'function'
+        ? structuredClone(value)
+        : JSON.parse(JSON.stringify(value));
+}
 
 function loadSettings() {
-    const extensionSettings = extension_settings?.[MODULE_NAME] || {};
+    const raw = extension_settings?.[MODULE_NAME] ?? DEFAULT_SETTINGS;
+    const normalized = normalizeSettings(raw);
+    settings = normalized;
+    extension_settings[MODULE_NAME] = settings;
 
-    // Proper deep merge: start with defaults, then apply user overrides
-    settings = { ...defaultSettings };
-
-    // Merge parsers array instead of overwriting completely
-    if (extensionSettings.parsers && Array.isArray(extensionSettings.parsers)) {
-        // User saved parsers take precedence, merge with defaults
-        const seenIds = new Set();
-        settings.parsers = extensionSettings.parsers.map(parser => {
-            let id = parser.id || generateUUID();
-            if (id.startsWith('parser_') || id.startsWith('mr_')) {
-                const cleanPrefix = parser.prefix?.replace(/[<>().,]/g, '').trim();
-                // If it's a legacy auto-gen ID, prefer using the tag prefix for the new ID
-                id = cleanPrefix || id;
-            }
-
-            // Ensure uniqueness within the current settings
-            let finalId = id;
-            let counter = 1;
-            while (seenIds.has(finalId)) {
-                finalId = `${id}_${counter++}`;
-            }
-            seenIds.add(finalId);
-
-            return {
-                ...PARSER_DEFAULTS,
-                ...parser,
-                id: finalId,
-            };
-        }).filter(parser => {
-            // Allow empty parsers (user is still editing)
-            if (!parser.prefix && !parser.suffix) return true;
-            // Filter out invalid parsers (missing prefix/suffix or identical)
-            return isValidParser(parser);
-        });
-    } else {
-        // No user parsers, use defaults with proper defaults applied
-        settings.parsers = defaultSettings.parsers.map(parser => ({
-            ...PARSER_DEFAULTS,
-            ...parser,
-        }));
+    // Persist the schema migration once. In particular, legacy random IDs are
+    // preserved rather than being rewritten from mutable tag text.
+    if (JSON.stringify(raw) !== JSON.stringify(normalized)) {
+        saveSettingsDebounced();
     }
-
-    console.log(`[${MODULE_NAME}] Settings loaded:`, settings);
 }
 
-function init() {
-    loadSettings();
-    patchReasoning();
-    // Reparse the current chat on initial load
-    setTimeout(reparseAllMessages, 500);
-    injectUI();
+function saveSettings() {
+    if (!settings) return;
+    extension_settings[MODULE_NAME] = settings;
+    saveSettingsDebounced();
+}
+
+function getParser(id) {
+    if (!settings || !id) return undefined;
+    const exact = settings.parsers.find(parser => parser.id === id);
+    if (exact) return exact;
+
+    // Compatibility with early MoreReasoning block IDs such as `mr_think` or
+    // `parser_think`. New IDs use `mr-<uuid>` and are never rewritten.
+    if (String(id).startsWith('mr_') || String(id).startsWith('parser_')) {
+        const legacyId = String(id).replace(/^(?:mr_|parser_)/, '');
+        return settings.parsers.find(parser => parser.id === legacyId);
+    }
+    return undefined;
+}
+
+function getPromptEligibleParser(id) {
+    const parser = getParser(id);
+    if (!parser) return undefined;
+    if (!parser.enabled || !parser.addToPrompts || normalizeMaxAdditions(parser.maxAdditions) <= 0) return undefined;
+    if (getParserValidationError(parser, settings.parsers)) return undefined;
+    return parser;
+}
+
+function cleanExtractedMessage(text) {
+    // Removing a leading reasoning block commonly leaves one or more blank lines.
+    // Remove only line breaks at the very start; do not globally trim user content.
+    return String(text ?? '').replace(/^(?:[\t ]*\r?\n)+/, '');
 }
 
 /**
- * Injects the "More Reasoning" settings into the SillyTavern UI.
+ * Parse custom tags from a message. This function never touches native reasoning
+ * fields (`extra.reasoning`, duration/type, or ReasoningHandler state).
+ * @param {number} messageId
+ * @returns {boolean} Whether message.mes or reasoning_blocks changed
  */
-function injectUI() {
-    const $target = $('#reasoning_add_to_prompts').closest('.flex-container').parent();
-    if (!$target.length) {
-        console.error(`[${MODULE_NAME}] Could not find injection target - Settings UI will be unavailable`);
+function parseCustomReasoning(messageId) {
+    if (!settings) return false;
+    const message = chat[messageId];
+    if (!message || message.is_user || message.is_system) return false;
+
+    const activeParsers = getActiveParsers(settings.parsers);
+    if (!activeParsers.length) return false;
+
+    const source = String(message.mes ?? '');
+    const isContinue = generationState?.type === 'continue'
+        && generationState.messageId === messageId
+        && source.startsWith(generationState.baseClean);
+    const hasRawPrefix = activeParsers.some(parser => source.includes(parser.prefix));
+    const canContinueIncomplete = isContinue && generationState.continuingBlockIndex >= 0;
+    if (!hasRawPrefix && !canContinueIncomplete) {
+        return false;
+    }
+
+    message.extra ??= {};
+    let parsed;
+    let nextBlocks;
+    let nextMes;
+
+    if (canContinueIncomplete) {
+        const baseBlock = generationState.baseBlocks[generationState.continuingBlockIndex];
+        const parser = getPromptEligibleParser(baseBlock?.parserId);
+
+        if (parser) {
+            const generatedPart = source.slice(generationState.baseClean.length);
+            const synthetic = `${parser.prefix}${baseBlock.content ?? ''}${generatedPart}`;
+            parsed = extractReasoningBlocks(synthetic, activeParsers, substituteParams);
+
+            if (parsed.blocks.length) {
+                nextBlocks = clone(generationState.baseBlocks);
+                nextBlocks.splice(generationState.continuingBlockIndex, 1, parsed.blocks[0]);
+                if (parsed.blocks.length > 1) {
+                    nextBlocks.push(...parsed.blocks.slice(1));
+                }
+                nextMes = generationState.baseClean + cleanExtractedMessage(parsed.cleanedText);
+            }
+        }
+    }
+
+    if (!parsed || !parsed.blocks.length) {
+        parsed = extractReasoningBlocks(source, activeParsers, substituteParams);
+        if (!parsed.blocks.length) return false;
+
+        nextMes = cleanExtractedMessage(parsed.cleanedText);
+        if (isContinue) {
+            // The raw stream for a continue starts from the already-clean visible
+            // message, so its newly parsed blocks are additions, not replacements.
+            nextBlocks = [...clone(generationState.baseBlocks), ...parsed.blocks];
+        } else {
+            nextBlocks = mergeReasoningBlocks(
+                message.extra.reasoning_blocks,
+                parsed.blocks,
+                parsed.parserIds,
+            );
+        }
+    }
+
+    const oldMes = String(message.mes ?? '');
+    const oldBlocks = Array.isArray(message.extra.reasoning_blocks)
+        ? message.extra.reasoning_blocks
+        : [];
+
+    message.mes = nextMes;
+    message.extra.reasoning_blocks = nextBlocks;
+    message.extra.mr_has_custom_blocks = nextBlocks.length > 0;
+
+    return oldMes !== nextMes || JSON.stringify(oldBlocks) !== JSON.stringify(nextBlocks);
+}
+
+function renderMessageText(messageId) {
+    const message = chat[messageId];
+    const messageDom = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    const mesText = messageDom?.querySelector('.mes_text');
+    if (!message || !mesText) return;
+
+    mesText.innerHTML = messageFormatting(
+        String(message.mes ?? ''),
+        message.name,
+        message.is_system,
+        message.is_user,
+        messageId,
+    );
+}
+
+function getBlockDisplayContent(block) {
+    return typeof block?.expandedContent === 'string'
+        ? block.expandedContent
+        : substituteParams(String(block?.content ?? ''));
+}
+
+function renderCustomBlocks(messageId) {
+    if (!settings) return;
+    const message = chat[messageId];
+    const messageDom = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    if (!message || !messageDom) return;
+
+    const blocks = Array.isArray(message.extra?.reasoning_blocks)
+        ? message.extra.reasoning_blocks
+        : [];
+    const displayable = blocks
+        .map((block, blockIndex) => ({ block, blockIndex, parser: getParser(block?.parserId) }))
+        .filter(({ block, parser }) => (
+            parser
+            && parser.enabled
+            && !getParserValidationError(parser, settings.parsers)
+            && (parser.showHidden || String(block?.content ?? '').trim())
+        ));
+
+    let container = messageDom.querySelector('.more-reasoning-container');
+    if (!displayable.length) {
+        container?.remove();
         return;
     }
 
-    const html = `
-        <div class="more-reasoning-settings-container">
-            <h4 class="standoutHeader">More Reasoning Parsers</h4>
-            <div id="more_reasoning_parsers_list"></div>
-            <div class="more-reasoning-actions">
-                <div id="more_reasoning_add_parser" class="menu_button more-reasoning-add-btn fa-solid fa-plus-circle" title="Add new parser"></div>
-                <span>Add New Parser</span>
-            </div>
-        </div>
-    `;
+    if (!container) {
+        container = document.createElement('div');
+        container.className = 'more-reasoning-container';
+        const mesText = messageDom.querySelector('.mes_text');
+        if (mesText?.parentNode) {
+            mesText.parentNode.insertBefore(container, mesText);
+        } else {
+            messageDom.appendChild(container);
+        }
+    }
 
-    $target.append(html);
-    renderParsers();
+    const previouslyOpen = new Set(
+        [...container.querySelectorAll('.more-reasoning-details[open]')]
+            .map(element => `${element.dataset.parserId}:${element.dataset.blockIndex}`),
+    );
+    container.replaceChildren();
 
-    $('#more_reasoning_add_parser').on('click', () => {
-        settings.parsers.push({
-            id: generateUUID(),
-            name: 'New Parser',
-            prefix: '',
-            suffix: '',
-            separator: '',
-            maxAdditions: 1,
-            enabled: true,
-            autoExpand: false,
-            addToPrompts: true,
-            showHidden: true,
-        });
-        renderParsers();
-        saveSettings();
+    for (const { block, blockIndex, parser } of displayable) {
+        const hidden = !String(block?.content ?? '').trim();
+        const details = document.createElement('details');
+        details.className = 'more-reasoning-details';
+        details.dataset.parserId = parser.id;
+        details.dataset.blockIndex = String(blockIndex);
+        details.dataset.state = hidden ? 'hidden' : block.incomplete ? 'thinking' : 'done';
+        const blockKey = `${parser.id}:${blockIndex}`;
+        if (previouslyOpen.has(blockKey) || (parser.autoExpand && !hidden) || block.incomplete) {
+            details.open = true;
+        }
+
+        const summary = document.createElement('summary');
+        summary.className = 'mes_reasoning_summary flex-container';
+
+        const headerBlock = document.createElement('div');
+        headerBlock.className = 'mes_reasoning_header_block mr_mes_reasoning_header_block flex-container';
+
+        const header = document.createElement('div');
+        header.className = 'mes_reasoning_header mr_mes_reasoning_header flex-container';
+
+        const title = document.createElement('span');
+        title.className = 'mes_reasoning_header_title';
+        title.textContent = hidden
+            ? `${parser.name} (Hidden)`
+            : block.incomplete
+                ? `${parser.name} (Thinking…)`
+                : parser.name;
+
+        const arrow = document.createElement('span');
+        arrow.className = 'mes_reasoning_arrow fa-solid fa-chevron-up';
+        arrow.setAttribute('aria-hidden', 'true');
+        header.append(title, arrow);
+        headerBlock.append(header);
+
+        const actions = document.createElement('div');
+        actions.className = 'mes_reasoning_actions flex-direction-row flex-container mr_mes_reasoning_actions';
+        actions.style.marginTop = '5px';
+
+        const confirmButton = document.createElement('div');
+        confirmButton.className = 'mr_mes_reasoning_edit_done mes_button edit_button fa-solid fa-check';
+        confirmButton.title = 'Confirm';
+        confirmButton.setAttribute('aria-label', 'Confirm reasoning edit');
+        confirmButton.hidden = true;
+
+        const cancelButton = document.createElement('div');
+        cancelButton.className = 'mr_mes_reasoning_edit_cancel mes_button edit_button fa-solid fa-xmark';
+        cancelButton.title = 'Cancel edit';
+        cancelButton.setAttribute('aria-label', 'Cancel reasoning edit');
+        cancelButton.hidden = true;
+
+        const editButton = document.createElement('div');
+        editButton.className = 'mr_mes_reasoning_edit mes_button fa-solid fa-pencil';
+        editButton.title = 'Edit custom reasoning';
+        editButton.setAttribute('aria-label', 'Edit custom reasoning');
+
+        actions.append(confirmButton, cancelButton, editButton);
+        summary.append(headerBlock, actions);
+
+        const content = document.createElement('div');
+        content.className = 'mr_mes_reasoning';
+        if (!hidden) {
+            content.innerHTML = messageFormatting(
+                getBlockDisplayContent(block),
+                '',
+                false,
+                false,
+                messageId,
+                {},
+                true,
+            );
+        }
+
+        details.append(summary, content);
+        container.append(details);
+    }
+}
+
+function renderAllVisibleCustomBlocks() {
+    document.querySelectorAll('#chat .mes[mesid]').forEach(element => {
+        const messageId = Number(element.getAttribute('mesid'));
+        if (!Number.isNaN(messageId)) renderCustomBlocks(messageId);
+    });
+}
+
+function scanChatForRawTags() {
+    if (!settings) return;
+    let changed = false;
+
+    for (let messageId = 0; messageId < chat.length; messageId++) {
+        const message = chat[messageId];
+        if (!message || message.is_user || message.is_system) continue;
+
+        if (parseCustomReasoning(messageId)) {
+            changed = true;
+            syncMesToSwipe(messageId);
+            renderMessageText(messageId);
+        }
+        renderCustomBlocks(messageId);
+    }
+
+    if (changed) saveChatDebounced();
+}
+
+function scheduleChatScan() {
+    clearTimeout(scanTimer);
+    scanTimer = setTimeout(scanChatForRawTags, SCAN_DEBOUNCE_MS);
+}
+
+function refreshValidationIndicators() {
+    if (!settings) return;
+    $('#more_reasoning_parsers_list .more-reasoning-parser-item').each(function () {
+        const index = Number($(this).attr('data-index'));
+        const parser = settings.parsers[index];
+        const error = getParserValidationError(parser, settings.parsers);
+        $(this).toggleClass('mr-parser-invalid', Boolean(error));
+        $(this).find('.mr-validation').text(error ?? '');
     });
 }
 
 function renderParsers() {
+    if (!settings) return;
     const $list = $('#more_reasoning_parsers_list');
+    if (!$list.length) return;
     $list.empty();
 
     settings.parsers.forEach((parser, index) => {
-        const itemHtml = `
+        const $item = $(`
             <div class="more-reasoning-parser-item" data-index="${index}">
                 <div class="flex-container alignItemsBaseline">
-                    <input class="mr-name text_pole flex1" type="text" placeholder="Parser Name">
-                    <div class="mr-delete menu_button fa-solid fa-trash-can" title="Delete parser"></div>
+                    <input class="mr-name text_pole flex1" type="text" placeholder="Parser Name" aria-label="Parser name">
+                    <button type="button" class="mr-delete menu_button fa-solid fa-trash-can" title="Delete parser" aria-label="Delete parser"></button>
                 </div>
 
-                <div class="flex-container alignItemsBaseline">
+                <div class="flex-container alignItemsBaseline mr-parser-toggles">
                     <label class="checkbox_label flex1" title="Automatically parse reasoning blocks from main content.">
                         <input class="mr-enabled" type="checkbox">
                         <small>Auto-Parse</small>
@@ -186,38 +387,36 @@ function renderParsers() {
                 </div>
 
                 <div class="flex-container alignItemsBaseline">
-                    <label class="checkbox_label flex1" title="Add existing reasoning blocks for this parser to prompts.">
+                    <label class="checkbox_label flex1" title="Add stored reasoning blocks for this parser to prompts.">
                         <input class="mr-add-to-prompts" type="checkbox">
                         <small>Add to Prompts</small>
                     </label>
-                    <div class="flex1 flex-container alignItemsBaseline" title="Maximum number of reasoning blocks to be added per prompt for this parser.">
-                        <input class="mr-max text_pole textarea_compact widthUnset" type="number" min="0" max="999">
+                    <label class="flex1 flex-container alignItemsBaseline mr-max-label" title="Maximum number of most-recent blocks added per prompt for this parser.">
+                        <input class="mr-max text_pole textarea_compact widthUnset" type="number" min="0" max="999" inputmode="numeric">
                         <small>Max</small>
-                    </div>
+                    </label>
                 </div>
 
-                <details open>
+                <details class="mr-formatting-details" open>
                     <summary></summary>
                     <div class="flex-container">
-                        <div class="flex1" title="Inserted before the reasoning content.">
+                        <label class="flex1" title="Inserted before reasoning content.">
                             <small>Prefix</small>
                             <textarea class="mr-prefix text_pole textarea_compact autoSetHeight" spellcheck="false"></textarea>
-                        </div>
-                        <div class="flex1" title="Inserted after the reasoning content.">
+                        </label>
+                        <label class="flex1" title="Inserted after reasoning content.">
                             <small>Suffix</small>
                             <textarea class="mr-suffix text_pole textarea_compact autoSetHeight" spellcheck="false"></textarea>
-                        </div>
+                        </label>
                     </div>
-                    <div class="flex-container">
-                        <div class="flex1" title="Inserted between the reasoning and the message content.">
-                            <small>Separator</small>
-                            <textarea class="mr-separator text_pole textarea_compact autoSetHeight" spellcheck="false"></textarea>
-                        </div>
-                    </div>
+                    <label class="mr-separator-label" title="Inserted between reasoning and visible message content in prompts.">
+                        <small>Separator</small>
+                        <textarea class="mr-separator text_pole textarea_compact autoSetHeight" spellcheck="false"></textarea>
+                    </label>
                 </details>
+                <div class="mr-validation" role="status" aria-live="polite"></div>
             </div>
-        `;
-        const $item = $(itemHtml);
+        `);
 
         $item.find('.mr-name').val(parser.name);
         $item.find('.mr-enabled').prop('checked', parser.enabled);
@@ -228,884 +427,361 @@ function renderParsers() {
         $item.find('.mr-prefix').val(parser.prefix);
         $item.find('.mr-suffix').val(parser.suffix);
         $item.find('.mr-separator').val(parser.separator);
-        $item.find('summary').text(`Formatting (${parser.name})`);
+        $item.find('.mr-formatting-details > summary').text(`Formatting (${parser.name})`);
 
-        $item.find('.mr-name').on('input', function () { parser.name = String($(this).val()); $item.find('summary').text(`Formatting (${parser.name})`); saveSettings(); });
-        $item.find('.mr-enabled').on('change', function () { parser.enabled = $(this).prop('checked'); saveSettings(); });
-        $item.find('.mr-expand').on('change', function () { parser.autoExpand = $(this).prop('checked'); saveSettings(); });
-        $item.find('.mr-add-to-prompts').on('change', function () { parser.addToPrompts = $(this).prop('checked'); saveSettings(); });
-        $item.find('.mr-show-hidden').on('change', function () { parser.showHidden = $(this).prop('checked'); saveSettings(); });
-        $item.find('.mr-prefix').on('input', function () { parser.prefix = String($(this).val()); saveSettings(); });
-        $item.find('.mr-suffix').on('input', function () { parser.suffix = String($(this).val()); saveSettings(); });
-        $item.find('.mr-separator').on('input', function () { parser.separator = String($(this).val()); saveSettings(); });
-        $item.find('.mr-max').on('input', function () { parser.maxAdditions = parseInt($(this).val()) || 0; saveSettings(); });
+        $item.find('.mr-name').on('input', function () {
+            parser.name = String($(this).val());
+            $item.find('.mr-formatting-details > summary').text(`Formatting (${parser.name})`);
+            saveSettings();
+            refreshValidationIndicators();
+            renderAllVisibleCustomBlocks();
+        });
+
+        $item.find('.mr-enabled').on('change', function () {
+            parser.enabled = $(this).prop('checked');
+            saveSettings();
+            refreshValidationIndicators();
+            renderAllVisibleCustomBlocks();
+            scheduleChatScan();
+        });
+
+        $item.find('.mr-expand').on('change', function () {
+            parser.autoExpand = $(this).prop('checked');
+            saveSettings();
+            renderAllVisibleCustomBlocks();
+        });
+
+        $item.find('.mr-show-hidden').on('change', function () {
+            parser.showHidden = $(this).prop('checked');
+            saveSettings();
+            renderAllVisibleCustomBlocks();
+        });
+
+        $item.find('.mr-add-to-prompts').on('change', function () {
+            parser.addToPrompts = $(this).prop('checked');
+            saveSettings();
+        });
+
+        $item.find('.mr-max').on('input', function () {
+            parser.maxAdditions = normalizeMaxAdditions($(this).val());
+            saveSettings();
+        });
+
+        const onTagInput = () => {
+            saveSettings();
+            refreshValidationIndicators();
+            renderAllVisibleCustomBlocks();
+            scheduleChatScan();
+        };
+
+        $item.find('.mr-prefix').on('input', function () {
+            parser.prefix = String($(this).val());
+            onTagInput();
+        });
+        $item.find('.mr-suffix').on('input', function () {
+            parser.suffix = String($(this).val());
+            onTagInput();
+        });
+        $item.find('.mr-separator').on('input', function () {
+            parser.separator = String($(this).val());
+            saveSettings();
+        });
+
         $item.find('.mr-delete').on('click', () => {
-            if (confirm(`Delete parser "${parser.name}"?`)) {
-                settings.parsers.splice(index, 1);
-                renderParsers();
-                saveSettings();
-            }
+            if (!confirm(`Delete parser "${parser.name}"? Stored blocks are preserved but will no longer be shown or injected.`)) return;
+            settings.parsers.splice(index, 1);
+            saveSettings();
+            renderParsers();
+            renderAllVisibleCustomBlocks();
         });
 
         $list.append($item);
     });
+
+    refreshValidationIndicators();
 }
 
-function saveSettings() {
-    extension_settings[MODULE_NAME] = settings;
-    saveSettingsDebounced();
-    // Reparse the chat if settings changed (e.g. a new parser was added or ID migrated)
-    reparseAllMessages();
+function injectUI() {
+    if ($('#more_reasoning_settings').length) return true;
+
+    const $target = $('#reasoning_add_to_prompts').closest('.flex-container').parent();
+    if (!$target.length) return false;
+
+    $target.append(`
+        <section id="more_reasoning_settings" class="more-reasoning-settings-container" aria-labelledby="more_reasoning_settings_title">
+            <h4 id="more_reasoning_settings_title" class="standoutHeader">More Reasoning Parsers</h4>
+            <div id="more_reasoning_parsers_list"></div>
+            <div class="more-reasoning-actions">
+                <div id="more_reasoning_add_parser" class="menu_button more-reasoning-add-btn fa-solid fa-plus-circle" title="Add new parser"></div>
+                <span>Add New Parser</span>
+            </div>
+        </section>
+    `);
+
+    $('#more_reasoning_add_parser').on('click', () => {
+        settings.parsers.push({
+            ...PARSER_DEFAULTS,
+            id: createParserId(),
+            name: 'New Parser',
+            prefix: '',
+            suffix: '',
+            separator: '\n\n',
+        });
+        saveSettings();
+        renderParsers();
+    });
+
+    renderParsers();
+    return true;
 }
 
-/**
- * Safely find a parser by its ID, with fallback for migrated legacy IDs.
- * @param {string} id - The parser ID to find
- * @returns {MoreReasoningParser|undefined}
- */
-function getParser(id) {
-    if (!id) return;
-    let parser = settings.parsers.find(p => p.id === id);
-    // Legacy fallback: check if it's an old 'mr_' or 'parser_' prefixed ID
-    if (!parser && (id.startsWith('mr_') || id.startsWith('parser_'))) {
-        const cleanId = id.replace(/^(mr_|parser_)/, '');
-        parser = settings.parsers.find(p => p.id === cleanId);
-    }
-    return parser;
-}
+function patchReasoningProcess() {
+    if (ReasoningHandler.prototype[PROCESS_PATCH_FLAG]) return;
 
-/**
- * Check if a parser has valid prefix/suffix tags.
- * @param {MoreReasoningParser} parser
- * @returns {boolean}
- */
-function isValidParser(parser) {
-    return parser && parser.prefix && parser.suffix && parser.prefix !== parser.suffix;
-}
+    const originalProcess = ReasoningHandler.prototype.process;
+    Object.defineProperty(ReasoningHandler.prototype, PROCESS_PATCH_FLAG, {
+        value: true,
+        configurable: false,
+        enumerable: false,
+        writable: false,
+    });
 
-// =========================================================================
-// Non-destructive reparse.
-//
-// Three cases handled:
-//
-// 1. ALREADY PARSED (reasoning_blocks exist):
-//    Previous code versions stripped tags from message.mes — they need to
-//    be reconstructed so the prompt builder can see them. We rebuild
-//    the tags into message.mes from the persisted reasoning_blocks data,
-//    then refresh the DOM (visual hider handles hiding them in the UI).
-//
-// 2. UNPARSED (raw tags still in message.mes):
-//    Run full process() to detect and register the blocks.
-//
-// 3. NEITHER:
-//    Skip — nothing to do.
-// =========================================================================
-async function reparseAllMessages() {
-    try {
-        console.log(`[${MODULE_NAME}] Reparsing all messages for reasoning blocks...`);
-        let processedCount = 0;
-
-        for (let i = 0; i < chat.length; i++) {
-            const message = chat[i];
-            if (!message || message.is_user) continue;
-
-            // Case 1: Already parsed — strip any legacy tags from message.mes,
-            // then refresh the DOM from the stored reasoning_blocks.
-            if (message.extra?.reasoning_blocks?.length) {
-                _stripTagsFromMes(message);
-                const handler = new ReasoningHandler();
-                handler._mr_isReparsing = true;
-                handler.updateDom(i);
-                processedCount++;
-                continue;
-            }
-
-            // Case 2: Raw tags still in message.mes — run full process()
-            const hasCustomTags = settings.parsers.some(
-                p => p.enabled && isValidParser(p) && message.mes.includes(p.prefix),
-            );
-            if (hasCustomTags) {
-                const handler = new ReasoningHandler();
-                handler._mr_isReparsing = true;
-                await handler.process(i, false);
-                processedCount++;
-            }
+    ReasoningHandler.prototype.process = async function (messageId, mesChanged, promptReasoning) {
+        let customChanged = false;
+        try {
+            customChanged = parseCustomReasoning(Number(messageId));
+        } catch (error) {
+            console.error(`[${MODULE_NAME}] Failed to parse custom reasoning for message ${messageId}:`, error);
         }
 
-        console.log(`[${MODULE_NAME}] Reparsed ${processedCount} messages`);
-    } catch (e) {
-        console.error(`[${MODULE_NAME}] Error reparsing messages:`, e);
-    }
-}
+        const result = await originalProcess.call(this, messageId, Boolean(mesChanged || customChanged), promptReasoning);
 
-/**
- * Strips any raw custom-parser tags from message.mes.
- * Runs on chat load to clean up any residue from older extension versions
- * that may have left tags inside the message body.
- * Tags are never injected back — they live only in reasoning_blocks and
- * are added to the prompt ephemerally by the addToMessage patch.
- * @param {object} message - The chat message object
- */
-function _stripTagsFromMes(message) {
-    if (!message.extra?.reasoning_blocks?.length) return;
-
-    for (const block of message.extra.reasoning_blocks) {
-        const parser = getParser(block.parserId);
-        if (!parser || !isValidParser(parser)) continue;
-
-        const fullTag = block.incomplete
-            ? parser.prefix + block.content
-            : parser.prefix + block.content + parser.suffix;
-
-        if (message.mes.includes(fullTag)) {
-            message.mes = message.mes.split(fullTag).join('').replace(/^\n+/, '');
+        if (customChanged || chat[messageId]?.extra?.reasoning_blocks?.length) {
+            renderCustomBlocks(Number(messageId));
         }
-    }
-}
-
-function patchReasoning() {
-    console.log(`[${MODULE_NAME}] Patching SillyTavern reasoning system...`);
-
-    // =========================================================================
-    // Patch finish() - suppress STREAM_REASONING_DONE when custom blocks exist
-    // so TTS doesn't fire prematurely. We emit it ourselves after processing.
-    // =========================================================================
-    const originalFinish = ReasoningHandler.prototype.finish;
-    ReasoningHandler.prototype.finish = async function (messageId) {
-        if (this._mr_suppressNativeFinish && this.state === ReasoningState.Thinking) {
-            // Advance state and persist, but skip the event emission
-            this.state = ReasoningState.Done;
-            this.updateReasoning(messageId, null, { persist: true });
-            this.updateDom(messageId);
-            return;
-        }
-        return originalFinish.call(this, messageId);
-    };
-
-    // =========================================================================
-    // Patch initHandleMessage() - detect overswipes (reset: true) and clear stale blocks
-    // =========================================================================
-    const originalInitHandleMessage = ReasoningHandler.prototype.initHandleMessage;
-    ReasoningHandler.prototype.initHandleMessage = function (messageIdOrElement, { reset = false } = {}) {
-        if (reset) {
-            const messageId = typeof messageIdOrElement === 'number'
-                ? messageIdOrElement
-                : Number(window.jQuery(messageIdOrElement).closest('.mes').attr('mesid'));
-
-            if (!isNaN(messageId) && chat[messageId]) {
-                const message = chat[messageId];
-                if (message.extra) {
-                    // Clear ALL reasoning-related fields to prevent carry-over/flicker during swiping.
-                    delete message.extra.reasoning_blocks;
-                    delete message.extra.mr_has_custom_blocks;
-                    delete message.extra.reasoning;
-                    delete message.extra.reasoning_type;
-                    delete message.extra.reasoning_duration;
-                    delete message.extra._mr_is_placeholder;
-                }
-            }
-        }
-
-        const result = originalInitHandleMessage.apply(this, arguments);
-
-        // If SillyTavern didn't find its own reasoning but we have custom blocks,
-        // force state to Done so updateDom doesn't skip rendering them.
-        const messageId = typeof messageIdOrElement === 'number'
-            ? messageIdOrElement
-            : Number(window.jQuery(messageIdOrElement).closest('.mes').attr('mesid'));
-        const message = chat[messageId];
-        if (message?.extra?.reasoning_blocks?.length && this.state === ReasoningState.None) {
-            this.state = ReasoningState.Done;
-        }
-
         return result;
     };
-
-    // =========================================================================
-    // Patch process() - detect custom tags before native handler, manage event
-    // =========================================================================
-    const originalProcess = ReasoningHandler.prototype.process;
-    ReasoningHandler.prototype.process = async function (messageId, mesChanged, promptReasoning) {
-        const message = chat[messageId];
-        if (!message || message.is_user) return;
-
-        if (!message.extra) message.extra = {};
-
-        const activeParsers = settings.parsers.filter(p => p.enabled && isValidParser(p));
-
-        // Detect custom tags BEFORE the original handler runs.
-        // The original handler returns early if !this.reasoning && !isHiddenReasoningModel,
-        // so we must detect and prepare custom content first.
-        let foundBlocks = [];
-        let placeholderSet = false;
-
-        if (activeParsers.length > 0) {
-            const workingContent = message.mes;
-            let cleanedMes = '';
-            let i = 0;
-
-            while (i < workingContent.length) {
-                let earliestPrefix = -1;
-                let matchedParser = null;
-
-                for (const parser of activeParsers) {
-                    const pos = workingContent.indexOf(parser.prefix, i);
-                    if (pos !== -1 && (earliestPrefix === -1 || pos < earliestPrefix)) {
-                        earliestPrefix = pos;
-                        matchedParser = parser;
-                    }
-                }
-
-                if (matchedParser) {
-                    // Check if this tag is nested inside another parser's tags.
-                    // If so, don't extract it — let the parent parser handle it.
-                    let isNested = false;
-                    for (const otherParser of activeParsers) {
-                        if (otherParser.id === matchedParser.id) continue;
-                        // Correctly detect if we are strictly inside another parser's tags
-                        const otherStartPos = workingContent.lastIndexOf(otherParser.prefix, Math.max(0, earliestPrefix - 1));
-                        if (otherStartPos !== -1) {
-                            const otherSuffixPos = workingContent.indexOf(otherParser.suffix, earliestPrefix);
-                            if (otherSuffixPos !== -1 && otherSuffixPos > earliestPrefix) {
-                                // This tag is inside another parser's scope — skip it
-                                isNested = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (isNested) {
-                        // Skip this tag, include it in cleanedMes as raw text
-                        cleanedMes += workingContent.substring(i, i + matchedParser.prefix.length);
-                        i += matchedParser.prefix.length;
-                        continue;
-                    }
-
-                    // Accumulate content BEFORE this tag into cleanedMes
-                    cleanedMes += workingContent.substring(i, earliestPrefix);
-                    const contentStart = earliestPrefix + matchedParser.prefix.length;
-                    const suffixPos = workingContent.indexOf(matchedParser.suffix, contentStart);
-
-                    if (suffixPos !== -1) {
-                        const rawContent = workingContent.substring(contentStart, suffixPos);
-                        foundBlocks.push({
-                            parserId: matchedParser.id,
-                            content: rawContent,
-                            expandedContent: substituteParams(rawContent),
-                            duration: 0,
-                        });
-                        i = suffixPos + matchedParser.suffix.length;
-                    } else {
-                        const rawContent = workingContent.substring(contentStart);
-                        foundBlocks.push({
-                            parserId: matchedParser.id,
-                            content: rawContent,
-                            expandedContent: substituteParams(rawContent),
-                            duration: 0,
-                            incomplete: true,
-                        });
-                        i = workingContent.length;
-                    }
-                } else {
-                    // No more tags — accumulate remainder
-                    cleanedMes += workingContent.substring(i);
-                    break;
-                }
-            }
-
-            // Strip custom tags from message.mes — mirrors native ST behaviour.
-            // Tags remain in reasoning_blocks and are injected into the prompt
-            // ephemerally at send time via the addToMessage patch.
-            // message.mes is kept clean so TTS never reads raw tag markup.
-            if (foundBlocks.length > 0) {
-                message.mes = cleanedMes;
-            }
-
-            // If custom blocks found and no native reasoning, set a placeholder
-            // so the original handler doesn't hit its early return
-            if (foundBlocks.length > 0 && !this.reasoning) {
-                this.reasoning = '\u200B';
-                message.extra._mr_is_placeholder = true;
-                placeholderSet = true;
-            }
-        }
-
-        // Flag finish() to suppress STREAM_REASONING_DONE if we have custom blocks.
-        // This prevents TTS from firing on empty/placeholder reasoning.
-        const shouldSuppressEvent = foundBlocks.length > 0;
-        if (shouldSuppressEvent) {
-            this._mr_suppressNativeFinish = true;
-        }
-
-        // Call the original handler (with placeholder set if needed)
-        await originalProcess.call(this, messageId, mesChanged, promptReasoning);
-
-        // Clear the suppression flag
-        if (shouldSuppressEvent) {
-            this._mr_suppressNativeFinish = false;
-        }
-
-        // After the original handler, process custom blocks
-        if (foundBlocks.length > 0) {
-            message.extra.reasoning_blocks = foundBlocks;
-            message.extra.mr_has_custom_blocks = true;
-
-            if (!this._mr_isReparsing) {
-                await eventSource.emit(event_types.STREAM_REASONING_DONE, '', 0, messageId, ReasoningState.Done);
-            }
-        } else {
-            // Only clear blocks if we detected new raw tags to re-parse.
-            // DO NOT clear blocks just because swipe IDs changed.
-            // This preserves reasoning blocks across swipes without tags.
-
-            // Clean up placeholder if no custom blocks were found in this pass,
-            // but a placeholder was previously set.
-            if (message.extra?._mr_is_placeholder) {
-                if (message.extra?.reasoning === '\u200B') {
-                    delete message.extra.reasoning;
-                }
-                delete message.extra._mr_is_placeholder;
-
-                // Reset handler state and re-render to remove placeholder UI
-                // Only if native reasoning isn't actually using the handler now.
-                if (!this.reasoning) {
-                    this.state = ReasoningState.None;
-                    this.reasoning = '';
-                    this.type = null;
-                }
-            }
-        }
-
-        this.updateDom(messageId);
-    };
-
-    // =========================================================================
-    // Patch PromptReasoning.isLimitReached — keep the ST prompt-builder loop
-    // alive for our custom parsers even when native reasoning is disabled.
-    //
-    // CRITICAL FIX: Track per-message counts to avoid stopping the loop
-    // prematurely when custom blocks on newer messages fill their limits,
-    // preventing native reasoning on older messages from being added.
-    // =========================================================================
-    const ensureInitialized = (instance) => {
-        if (instance._mr_initialized) return;
-        instance._mr_initialized = true;
-        instance._mr_seenTotal = {};  // Global counter: total blocks added per parser
-        instance._mr_completedCount = {};  // Track complete blocks added per parser
-        settings.parsers.forEach(p => {
-            instance._mr_seenTotal[p.id] = 0;
-            instance._mr_completedCount[p.id] = 0;
-        });
-        // Sequence mirrors coreChat: non-system messages, newest first
-        instance._mr_sequence = chat.filter(m => !m.is_system).reverse();
-        instance._mr_cursor = 0; // addToMessage reads first; isLimitReached advances after each ST loop item
-    };
-
-    const originalIsLimitReached = PromptReasoning.prototype.isLimitReached;
-    PromptReasoning.prototype.isLimitReached = function () {
-        ensureInitialized(this);
-
-        // Advance cursor for history synchronization. ST calls addToMessage()
-        // before this method on each loop iteration.
-        this._mr_cursor++;
-
-        // If native logic says we are not yet done, keep going
-        if (!originalIsLimitReached.call(this)) {
-            return false;
-        }
-        // Check if any of our custom parsers still need more blocks
-        const stillNeedsMore = settings.parsers.some(parser => {
-            if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return false;
-
-            // Count total blocks added for this parser
-            const totalSeen = this._mr_seenTotal[parser.id] ?? 0;
-
-            // Keep the loop alive as long as we haven't reached maxAdditions yet
-            // AND we haven't processed all messages in the sequence
-            const hasMoreMessages = this._mr_cursor < this._mr_sequence.length;
-            const stillNeedsBlocks = totalSeen < parser.maxAdditions;
-
-            return stillNeedsBlocks && hasMoreMessages;
-        });
-        // Return true (limit reached) ONLY when both native is done AND we don't need any more blocks
-        return !stillNeedsMore;
-    };
-
-    // =========================================================================
-    // Patch PromptReasoning.addToMessage — inject custom blocks from
-    // reasoning_blocks at send time, not from message.mes.
-    //
-    // Architecture (mirrors native ST reasoning):
-    //   message.mes  = clean text, no tags (TTS-safe)
-    //   reasoning_blocks = the block data, stored separately
-    //   addToMessage = builds tags from reasoning_blocks and prepends to content
-    //
-    //   ST loop: for (let i = coreChat.length-1; i >= 0; i--) — NEWEST FIRST.
-    //   We mirror this with a cursor into chat (filtered to non-system, reversed)
-    //   advancing once per addToMessage call. Counter tracks "keep last N".
-    // =========================================================================
-    const originalAddToMessage = PromptReasoning.prototype.addToMessage;
-    PromptReasoning.prototype.addToMessage = function (content, reasoning, isPrefix, duration) {
-        ensureInitialized(this);
-
-        // Call original to get native reasoning (prepended to content)
-        let finalContent = originalAddToMessage.call(this, content, reasoning, isPrefix, duration);
-
-        // Use index 0 for the active generation prefix, otherwise use the history cursor.
-        // The cursor advances in isLimitReached after this call, matching ST's loop.
-        const currentMessage = isPrefix ? this._mr_sequence[0] : this._mr_sequence[this._mr_cursor];
-        if (!currentMessage?.extra?.reasoning_blocks?.length) {
-            return finalContent;
-        }
-
-        // Build the injection string from blocks according to parser settings
-        // Track which parsers have added a complete block from THIS message
-        const addedCompleteThisMessage = new Set();
-        let injection = '';
-        currentMessage.extra.reasoning_blocks.forEach(block => {
-            const parser = getParser(block.parserId);
-            if (!parser || !isValidParser(parser)) return;
-            if (!parser.enabled || !parser.addToPrompts || parser.maxAdditions <= 0) return;
-
-            const isComplete = !block.incomplete;
-            
-            // Skip if this is a completed block and we've already added one complete block for this parser from this message
-            if (isComplete && addedCompleteThisMessage.has(parser.id)) return;
-            
-            // Skip if we've already added Max complete blocks for this parser across all messages
-            if (isComplete && this._mr_completedCount[parser.id] >= parser.maxAdditions) return;
-
-            // Track total blocks added for this parser across all messages
-            this._mr_seenTotal[parser.id]++;
-            
-            // Only add if we haven't hit the limit yet
-            if (this._mr_seenTotal[parser.id] <= parser.maxAdditions) {
-                const prefix = substituteParams(parser.prefix);
-                const suffix = substituteParams(parser.suffix);
-                const sep = substituteParams(parser.separator || '');
-                // Use cached expandedContent that was frozen when block was created
-                const content = block.expandedContent || substituteParams(block.content);
-                injection += prefix + content + suffix + sep;
-                
-                // Mark this parser as having added a complete block from this message
-                if (isComplete) {
-                    addedCompleteThisMessage.add(parser.id);
-                    this._mr_completedCount[parser.id]++;
-                }
-            }
-        });
-
-        if (injection) {
-            // Reorganize to maintain: [native reasoning] [custom reasoning] [content]
-            // Original call gives us: native_wrapped + content
-            // We need to extract native_wrapped and rebuild with injection in between
-            const contentIndex = finalContent.lastIndexOf(content);
-            if (contentIndex !== -1) {
-                const nativeWrapped = finalContent.substring(0, contentIndex);
-                finalContent = nativeWrapped + injection + content;
-            }
-        }
-
-        return finalContent;
-    };
-
-    // =========================================================================
-    // Patch updateDom for multi-block rendering.
-    //
-    // Two critical corrections vs. the naive approach:
-    //
-    // 1. SELECTOR COLLISION: The native #checkDomElements uses
-    //    querySelector('.mes_reasoning_details') which would match our custom
-    //    blocks too (they share that class for styling). We give our blocks
-    //    the extra class 'more-reasoning-details' and native lookup must
-    //    use ':not(.more-reasoning-details)'. Since we can't change the
-    //    private #checkDomElements, we ensure our container is inserted
-    //    AFTER the native block, and we use the scoped selector ourselves.
-    //
-    // 2. FRESH-HANDLER STATE LOSS: When called from reparseAllMessages with a
-    //    brand-new ReasoningHandler (state=None, reasoning=''), the native
-    //    originalUpdateDom would wipe the native block clean (toggle
-    //    .reasoning=false, empty content). We pre-load state from
-    //    message.extra before calling originalUpdateDom so it renders
-    //    correctly just like initHandleMessage would.
-    // =========================================================================
-    const originalUpdateDom = ReasoningHandler.prototype.updateDom;
-    ReasoningHandler.prototype.updateDom = function (messageId) {
-        const message = chat[messageId];
-        if (!message) return;
-
-        // Pre-load state from persisted extra when handler has no live state.
-        // This happens when updateDom is called directly (e.g. from reparseAllMessages)
-        // on a fresh handler instance instead of one that was used during streaming.
-        if (this.state === ReasoningState.None && !this.reasoning) {
-            const extra = message.extra;
-            if (extra?.reasoning) {
-                // Strip our own ZWS markers before loading into the handler
-                const cleanReasoning = extra.reasoning.replace(/\u200B/g, '').trim();
-                if (cleanReasoning) {
-                    this.reasoning = cleanReasoning;
-                    this.state = ReasoningState.Done;
-                    this.type = extra.reasoning_type ?? null;
-                    if (extra.reasoning_duration && message.gen_started) {
-                        this.initialTime = new Date(message.gen_started);
-                        this.startTime = this.initialTime;
-                        this.endTime = new Date(this.initialTime.getTime() + extra.reasoning_duration);
-                    }
-                }
-            } else if (extra?.reasoning_duration) {
-                // Hidden reasoning model — has duration but no text
-                this.state = ReasoningState.Hidden;
-                this.type = extra.reasoning_type ?? null;
-            }
-        }
-
-        originalUpdateDom.call(this, messageId);
-
-        const messageDom = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-        if (!messageDom) return;
-
-        const mesText = messageDom.querySelector('.mes_text');
-
-        // -----------------------------------------------------------------------
-        // Visual hider: strip raw tags from rendered bubble text via a
-        // MutationObserver so we win the race against SillyTavern's streaming.
-        // -----------------------------------------------------------------------
-        const applyVisualHider = () => {
-            if (!mesText || !message.extra?.reasoning_blocks?.length) return;
-
-            // Ensure observer exists (created once, persists until chat change)
-            if (!mesText._mrObserver) {
-                mesText._mrObserver = new MutationObserver(() => applyVisualHider());
-                mesText._mrObserver.observe(mesText, { childList: true, characterData: true, subtree: true });
-            }
-
-            let displayMes = message.mes;
-            let stripped = false;
-
-            message.extra.reasoning_blocks.forEach(block => {
-                const parser = getParser(block.parserId);
-                if (parser && isValidParser(parser)) {
-                    const suffixToUse = block.incomplete ? '' : parser.suffix;
-                    const exactString = parser.prefix + block.content + suffixToUse;
-                    if (displayMes.includes(exactString)) {
-                        displayMes = displayMes.split(exactString).join('');
-                        stripped = true;
-                    }
-                }
-            });
-
-            if (stripped) {
-                mesText.innerHTML = messageFormatting(
-                    displayMes.trim(),
-                    message.name,
-                    message.is_system,
-                    message.is_user,
-                    messageId
-                );
-            }
-        };
-        applyVisualHider();
-
-        // Hide custom container if the handler was reset (e.g., during swiping animation)
-        // or if it's a hidden reasoning model starting a fresh thought.
-        // GUARD: Do NOT remove if we have custom reasoning blocks to show.
-        if (!message.extra?.reasoning_blocks?.length && (this.state === ReasoningState.None || (this.state === ReasoningState.Thinking && !this.reasoning)) && !this._mr_isReparsing) {
-            const container = messageDom.querySelector('.more-reasoning-container');
-            if (container) container.remove();
-            return;
-        }
-
-        if (!message?.extra?.reasoning_blocks?.length) {
-            // No blocks — remove stale container if it exists
-            const container = messageDom.querySelector('.more-reasoning-container');
-            if (container) container.remove();
-            return;
-        }
-
-        // -----------------------------------------------------------------------
-        // Custom block container.
-        // Use ':not(.more-reasoning-details)' to find the NATIVE block only,
-        // avoiding selector collision with our own injected detail elements.
-        // -----------------------------------------------------------------------
-        let multiContainer = messageDom.querySelector('.more-reasoning-container');
-        if (!multiContainer) {
-            multiContainer = document.createElement('div');
-            multiContainer.className = 'more-reasoning-container';
-            // Native block selector — explicitly exclude our custom blocks
-            const nativeReasoning = messageDom.querySelector('.mes_reasoning_details:not(.more-reasoning-details)');
-            if (nativeReasoning) {
-                // Insert AFTER the native reasoning details block
-                if (nativeReasoning.nextSibling) {
-                    nativeReasoning.parentNode.insertBefore(multiContainer, nativeReasoning.nextSibling);
-                } else {
-                    nativeReasoning.parentNode.appendChild(multiContainer);
-                }
-            } else if (mesText) {
-                mesText.parentNode.insertBefore(multiContainer, mesText);
-            } else {
-                messageDom.appendChild(multiContainer);
-            }
-        }
-
-        multiContainer.innerHTML = '';
-        message.extra.reasoning_blocks.forEach((block, blockIndex) => {
-            const parser = getParser(block.parserId);
-            if (!parser) return;
-            if (!parser.enabled) return; // parser disabled — don't show its blocks
-            if (!parser.showHidden && !String(block.content ?? '').trim()) return;
-
-            const details = document.createElement('details');
-            // 'mes_reasoning_details' for ST CSS styling,
-            // 'more-reasoning-details' as our own class + :not() guard above
-            details.className = 'mes_reasoning_details more-reasoning-details';
-
-            // Build a descriptive ID for CSS targeting: parser_{tag}_{messageId}_{index}
-            const cleanTag = parser.prefix.replace(/[<>().,]/g, '').trim() || 'block';
-            details.id = `parser_${cleanTag}_${messageId}_${blockIndex}`;
-
-            details.dataset.parserId = parser.id; // required for editing
-            details.dataset.blockIndex = String(blockIndex);
-            const isHiddenBlock = !String(block.content ?? '').trim();
-            if (isHiddenBlock) details.dataset.state = 'hidden';
-            else if (block.incomplete) details.dataset.state = 'thinking';
-            if (parser.autoExpand || block.incomplete) details.open = true;
-
-            const headerTitle = isHiddenBlock ? `${parser.name} (Hidden)` : block.incomplete ? `${parser.name} (Thinking...)` : parser.name;
-
-            // Add custom reasoning actions with edit buttons
-            const summary = document.createElement('summary');
-            summary.className = 'mes_reasoning_summary flex-container';
-            const headerBlock = document.createElement('div');
-            headerBlock.className = 'mes_reasoning_header_block mr_mes_reasoning_header_block flex-container';
-            const header = document.createElement('div');
-            header.className = 'mes_reasoning_header mr_mes_reasoning_header flex-container';
-            const title = document.createElement('span');
-            title.className = 'mes_reasoning_header_title';
-            title.textContent = headerTitle;
-            const arrow = document.createElement('div');
-            arrow.className = 'mes_reasoning_arrow fa-solid fa-chevron-up';
-            header.append(title, arrow);
-            headerBlock.append(header);
-
-            const actions = document.createElement('div');
-            actions.className = 'mes_reasoning_actions flex-direction-row flex-container mr_mes_reasoning_actions';
-            actions.style.marginTop = '5px';
-            actions.innerHTML = `
-                <div class="mr_mes_reasoning_edit_done menu_button edit_button fa-solid fa-check" title="Confirm" style="display:none"></div>
-                <div class="mr_mes_reasoning_edit_cancel menu_button edit_button fa-solid fa-xmark" title="Cancel edit" style="display:none"></div>
-                <div class="mr_mes_reasoning_edit mes_button fa-solid fa-pencil" title="Edit custom reasoning"></div>
-            `;
-            summary.append(headerBlock, actions);
-
-            const content = document.createElement('div');
-            content.className = 'mr_mes_reasoning';
-            if (!isHiddenBlock) {
-                content.innerHTML = messageFormatting(block.expandedContent || substituteParams(block.content), '', false, false, messageId, {}, true);
-            }
-            details.append(summary, content);
-            multiContainer.appendChild(details);
-        });
-
-        // If all blocks were filtered (e.g. all parsers disabled), remove the
-        // empty container so it doesn't leave stale CSS/layout artifacts.
-        if (!multiContainer.innerHTML.trim()) {
-            multiContainer.remove();
-        }
-    };
-
-    // Custom block editing handlers - these need to target custom blocks only
-    $(document).on('click', '.more-reasoning-details .mr_mes_reasoning_edit', function (e) {
-        e.stopPropagation();
-        e.preventDefault();
-
-        const details = $(this).closest('.more-reasoning-details');
-        const messageBlock = details.closest('.mes');
-        const messageId = Number(messageBlock.attr('mesid'));
-        const message = chat[messageId];
-        const parserId = details.attr('data-parser-id');
-        const blockIndex = Number(details.attr('data-block-index'));
-
-        if (!message || !message.extra?.reasoning_blocks) return;
-        const block = message.extra.reasoning_blocks[blockIndex];
-        if (!block || block.parserId !== parserId) return;
-
-        const reasoningBlock = details.find('.mr_mes_reasoning');
-        const textarea = document.createElement('textarea');
-        textarea.classList.add('reasoning_edit_textarea', 'mr_reasoning_edit_textarea');
-        textarea.value = block.content;
-        $(textarea).insertBefore(reasoningBlock);
-
-        if (!CSS.supports('field-sizing', 'content')) {
-            const resetHeight = function () {
-                textarea.style.height = '0px';
-                textarea.style.height = `${textarea.scrollHeight}px`;
-            };
-            textarea.addEventListener('input', resetHeight);
-            setTimeout(resetHeight, 0);
-        }
-
-        reasoningBlock.hide();
-        details.find('.mr_mes_reasoning_edit').hide();
-        details.find('.mr_mes_reasoning_edit_cancel').show();
-        details.find('.mr_mes_reasoning_edit_done').show();
-
-        textarea.focus();
-    });
-
-    $(document).on('click', '.mr_mes_reasoning_edit_cancel', function (e) {
-        e.stopPropagation();
-        e.preventDefault();
-
-        const details = $(this).closest('.more-reasoning-details');
-        details.find('.mr_reasoning_edit_textarea').remove();
-        details.find('.mr_mes_reasoning').show();
-        details.find('.mr_mes_reasoning_edit_cancel').hide();
-        details.find('.mr_mes_reasoning_edit_done').hide();
-        details.find('.mr_mes_reasoning_edit').show();
-    });
-
-    $(document).on('click', '.mr_mes_reasoning_edit_done', async function (e) {
-        e.stopPropagation();
-        e.preventDefault();
-
-        const details = $(this).closest('.more-reasoning-details');
-        const messageBlock = details.closest('.mes');
-        const messageId = Number(messageBlock.attr('mesid'));
-        const message = chat[messageId];
-        const parserId = details.attr('data-parser-id');
-        const blockIndex = Number(details.attr('data-block-index'));
-
-        if (!message || !message.extra?.reasoning_blocks) return;
-        const block = message.extra.reasoning_blocks[blockIndex];
-        if (!block || block.parserId !== parserId) return;
-
-        const textarea = details.find('.mr_reasoning_edit_textarea');
-        const newContent = String(textarea.val());
-
-        if (block.content !== newContent) {
-            block.content = newContent;
-            // Update expandedContent so the UI reflects the change
-            block.expandedContent = substituteParams(newContent);
-            saveChatDebounced();
-            await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
-        }
-
-        // Let the normal DOM update path refresh the element
-        const handler = new ReasoningHandler();
-        handler.updateDom(messageId);
-    });
-
-    // Override click handler for custom reasoning headers
-    // SillyTavern's default handler targets .mes_reasoning_header but doesn't
-    // work for our custom <details> elements — we need to toggle manually.
-    $(document).on('click', '.more-reasoning-details .mes_reasoning_header', function (e) {
-        e.stopPropagation();
-        e.preventDefault();
-
-        const details = $(this).closest('.more-reasoning-details');
-        if (details.length) {
-            // Toggle the open attribute
-            if (details[0].hasAttribute('open')) {
-                details[0].removeAttribute('open');
-            } else {
-                details[0].setAttribute('open', '');
-            }
-        }
-    });
-
-    console.log(`[${MODULE_NAME}] Patching complete.`);
 }
 
-eventSource.on(event_types.APP_READY, () => {
-    init();
+async function handleMessageEvent(messageId) {
+    const id = Number(messageId);
+    if (Number.isNaN(id) || !chat[id]) return;
+
+    const changed = parseCustomReasoning(id);
+    if (changed) {
+        syncMesToSwipe(id);
+        saveChatDebounced();
+        renderMessageText(id);
+    }
+    renderCustomBlocks(id);
+}
+
+function beginGeneration(type) {
+    if (type !== 'continue' || !chat.length) {
+        generationState = { type: String(type ?? ''), messageId: -1, baseClean: '', baseBlocks: [], continuingBlockIndex: -1 };
+        return;
+    }
+
+    const messageId = chat.length - 1;
+    const message = chat[messageId];
+    const baseBlocks = clone(Array.isArray(message?.extra?.reasoning_blocks) ? message.extra.reasoning_blocks : []);
+    let continuingBlockIndex = -1;
+
+    for (let i = baseBlocks.length - 1; i >= 0; i--) {
+        if (baseBlocks[i]?.incomplete && getPromptEligibleParser(baseBlocks[i].parserId)) {
+            continuingBlockIndex = i;
+            break;
+        }
+    }
+
+    generationState = {
+        type: 'continue',
+        messageId,
+        baseClean: String(message?.mes ?? ''),
+        baseBlocks,
+        continuingBlockIndex,
+    };
+}
+
+function endGeneration() {
+    generationState = null;
+}
+
+/**
+ * SillyTavern generation interceptor. It operates on the exact post-processed
+ * coreChat supplied by ST, so swipes, tool-call system messages and future core
+ * history filtering remain aligned automatically.
+ */
+globalThis[GENERATE_INTERCEPTOR_KEY] = async function (coreChat, _contextSize, _abort, type) {
+    if (!settings) loadSettings();
+    if (!Array.isArray(coreChat) || !coreChat.length || !settings?.parsers?.length) return;
+
+    const skipMessage = item => Boolean(
+        item?.is_user
+        || item?.is_system
+        || (selected_group && item?.name !== name2),
+    );
+    const selected = selectPromptBlocks(coreChat, settings.parsers, skipMessage);
+    if (!selected.size) return;
+
+    const lastMessageIndex = coreChat.length - 1;
+    for (let messageIndex = 0; messageIndex < coreChat.length; messageIndex++) {
+        const item = coreChat[messageIndex];
+        if (skipMessage(item, messageIndex)) continue;
+
+        const injection = buildPromptInjection(
+            item,
+            messageIndex,
+            selected,
+            settings.parsers,
+            substituteParams,
+            { type, lastMessageIndex },
+        );
+        if (injection) {
+            // Native reasoning, if present, is already in item.mes at this point.
+            // Prepending here avoids brittle reconstruction of ST's regex/file/title
+            // transformed content while keeping the operation fully ephemeral.
+            item.mes = injection + item.mes;
+        }
+    }
+};
+
+function init() {
+    if (initialized) return;
+    initialized = true;
+
+    loadSettings();
+    patchReasoningProcess();
+
+    if (!injectUI()) {
+        // APP_READY should normally have the target. A short observer makes the
+        // settings panel robust to delayed/rebuilt settings DOM without polling.
+        const observer = new MutationObserver(() => {
+            if (injectUI()) observer.disconnect();
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    scanChatForRawTags();
+    renderAllVisibleCustomBlocks();
+    console.info(`[${MODULE_NAME}] Initialized with ${settings.parsers.length} parser(s).`);
+}
+
+$(document).on('click', '.more-reasoning-details .mr_mes_reasoning_edit', function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const details = $(this).closest('.more-reasoning-details');
+    const messageId = Number(details.closest('.mes').attr('mesid'));
+    const blockIndex = Number(details.attr('data-block-index'));
+    const parserId = details.attr('data-parser-id');
+    const block = chat[messageId]?.extra?.reasoning_blocks?.[blockIndex];
+    if (!block || block.parserId !== parserId || details.find('.mr_reasoning_edit_textarea').length) return;
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'reasoning_edit_textarea mr_reasoning_edit_textarea';
+    textarea.value = String(block.content ?? '');
+    details.find('.mr_mes_reasoning').before(textarea);
+    details.find('.mr_mes_reasoning').hide();
+    details.find('.mr_mes_reasoning_edit').prop('hidden', true);
+    details.find('.mr_mes_reasoning_edit_done, .mr_mes_reasoning_edit_cancel').prop('hidden', false);
+    details.prop('open', true);
+
+    if (!CSS.supports('field-sizing', 'content')) {
+        const resetHeight = () => {
+            textarea.style.height = '0px';
+            textarea.style.height = `${textarea.scrollHeight}px`;
+        };
+        textarea.addEventListener('input', resetHeight);
+        requestAnimationFrame(resetHeight);
+    }
+    textarea.focus();
 });
 
-async function checkAndParseMessage(messageId, forceReset = false) {
-    try {
-        const message = chat[messageId];
-        if (!message || message.is_user) return;
+$(document).on('click', '.more-reasoning-details .mr_mes_reasoning_edit_cancel', function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const details = $(this).closest('.more-reasoning-details');
+    details.find('.mr_reasoning_edit_textarea').remove();
+    details.find('.mr_mes_reasoning').show();
+    details.find('.mr_mes_reasoning_edit').prop('hidden', false);
+    details.find('.mr_mes_reasoning_edit_done, .mr_mes_reasoning_edit_cancel').prop('hidden', true);
+});
 
-        // Check if this message actually has raw tags that need parsing first
-        const hasRawTags = settings.parsers.some(
-            p => p.enabled && isValidParser(p) && message.mes.includes(p.prefix),
-        );
+$(document).on('click', '.more-reasoning-details .mr_mes_reasoning_edit_done', async function (event) {
+    event.preventDefault();
+    event.stopPropagation();
 
-        // Also check if this is a fresh overswipe starting (SillyTavern sets mes to '...')
-        const isNewGeneration = message.mes === '...';
+    const details = $(this).closest('.more-reasoning-details');
+    const messageId = Number(details.closest('.mes').attr('mesid'));
+    const blockIndex = Number(details.attr('data-block-index'));
+    const parserId = details.attr('data-parser-id');
+    const message = chat[messageId];
+    const block = message?.extra?.reasoning_blocks?.[blockIndex];
+    if (!message || !block || block.parserId !== parserId) return;
 
-        // Clear existing blocks if:
-        // 1. Force reset (e.g., manually triggered refreshing), OR
-        // 2. New raw tags detected (needs re-parsing), OR
-        // 3. New generation starting (to clear stale blocks from copied variant)
-        if ((forceReset || hasRawTags || isNewGeneration) && message.extra) {
+    const newContent = String(details.find('.mr_reasoning_edit_textarea').val() ?? '');
+    if (block.content !== newContent) {
+        block.content = newContent;
+        block.expandedContent = substituteParams(newContent);
+        syncMesToSwipe(messageId);
+        saveChatDebounced();
+        await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    }
+    renderCustomBlocks(messageId);
+});
+
+// Prevent action buttons inside <summary> from toggling the details element.
+$(document).on('click', '.mr_mes_reasoning_actions > *', event => event.stopPropagation());
+
+// SillyTavern also handles clicks on .mes_reasoning_header. Because our custom
+// blocks reuse that native class for styling, explicitly own the interaction
+// here so custom <details> always expand/collapse reliably.
+$(document).on('click', '.more-reasoning-details .mes_reasoning_header', function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const details = $(this).closest('.more-reasoning-details');
+    if (!details.length) return;
+
+    details.prop('open', !details.prop('open'));
+});
+
+eventSource.on(event_types.APP_READY, init);
+eventSource.on(event_types.CHAT_LOADED, () => {
+    if (!settings) return;
+    scanChatForRawTags();
+    renderAllVisibleCustomBlocks();
+});
+eventSource.on(event_types.MORE_MESSAGES_LOADED, () => renderAllVisibleCustomBlocks());
+eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, messageId => renderCustomBlocks(Number(messageId)));
+eventSource.on(event_types.MESSAGE_RECEIVED, messageId => handleMessageEvent(messageId));
+eventSource.on(event_types.MESSAGE_UPDATED, messageId => handleMessageEvent(messageId));
+eventSource.on(event_types.MESSAGE_SWIPED, async messageId => {
+    const id = Number(messageId);
+    const message = chat[id];
+    if (!message) return;
+
+    // Overswipe regeneration creates an empty slot past the stored swipe array.
+    // ST leaves the old swipe's extra object in place until generation begins,
+    // so clear custom blocks here to prevent stale UI/state carry-over.
+    if (typeof message.swipe_id === 'number'
+        && Array.isArray(message.swipes)
+        && message.swipe_id >= message.swipes.length) {
+        if (message.extra) {
             delete message.extra.reasoning_blocks;
             delete message.extra.mr_has_custom_blocks;
         }
-
-        const handler = new ReasoningHandler();
-        handler._mr_isReparsing = true;
-        await handler.process(messageId, false);
-    } catch (e) {
-        console.error(`[${MODULE_NAME}] Error parsing message ${messageId}:`, e);
+        renderCustomBlocks(id);
+        return;
     }
-}
 
-// Catch messages from non-streamed inference and swipes.
-eventSource.on(event_types.MESSAGE_RECEIVED, async (messageId) => {
-    try {
-        await checkAndParseMessage(messageId);
-    } catch (e) {
-        console.error(`[${MODULE_NAME}] Error handling MESSAGE_RECEIVED:`, e);
-    }
+    await handleMessageEvent(id);
 });
-
-eventSource.on(event_types.MESSAGE_SWIPED, async (messageId) => {
-    try {
-        // DO NOT force reset here anymore.
-        // If it's a new generation, checkAndParseMessage will detect '...' and clear.
-        // If it's a return to an old swipe, ST core has already restored the 'extra' data,
-        // and we want to preserve it rather than clearing it unconditionally.
-        await checkAndParseMessage(messageId, false);
-    } catch (e) {
-        console.error(`[${MODULE_NAME}] Error handling MESSAGE_SWIPED:`, e);
-    }
-});
-// Catch tags added during message edits
-let _mr_handlingMessageUpdate = false;
-eventSource.on(event_types.MESSAGE_UPDATED, async (messageId) => {
-    // Prevent infinite loop when we emit MESSAGE_UPDATED ourselves after editing blocks
-    if (_mr_handlingMessageUpdate) return;
-    _mr_handlingMessageUpdate = true;
-    try {
-        await checkAndParseMessage(messageId);
-    } catch (e) {
-        console.error(`[${MODULE_NAME}] Error handling MESSAGE_UPDATED:`, e);
-    } finally {
-        _mr_handlingMessageUpdate = false;
-    }
-});
-
-// CHARACTER_MESSAGE_RENDERED for per-message DOM patching (hot path)
-eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => {
-    const message = chat[messageId];
-    if (!message || message.is_user) return;
-
-    // Always force updateDom on render - fixes swipe navigation not showing blocks
-    const handler = new ReasoningHandler();
-    handler.updateDom(messageId);
-});
-
-// CHAT_LOADED fallback for initial parse of unprocessed messages
-eventSource.on(event_types.CHAT_LOADED, () => {
-    reparseAllMessages();
-});
-
-// Clean up MutationObservers on chat switch to prevent memory leaks
+eventSource.on(event_types.GENERATION_STARTED, type => beginGeneration(type));
+eventSource.on(event_types.GENERATION_ENDED, endGeneration);
+eventSource.on(event_types.GENERATION_STOPPED, endGeneration);
 eventSource.on(event_types.CHAT_CHANGED, () => {
-    document.querySelectorAll('.mes_text').forEach(el => {
-        if (el._mrObserver) {
-            el._mrObserver.disconnect();
-            delete el._mrObserver;
-        }
-    });
+    clearTimeout(scanTimer);
+    generationState = null;
 });

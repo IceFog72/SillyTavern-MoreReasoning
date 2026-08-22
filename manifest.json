@@ -6,8 +6,10 @@
     "js": "index.js",
     "css": "style.css",
     "author": "icefog72",
-    "version": "0.2.11",
+    "version": "0.3.2",
     "homePage": "https://github.com/IceFog72/SillyTavern-MoreReasoning",
     "auto_update": true,
-    "description": "Expand SillyTavern's reasoning system to support multiple independent reasoning parsers with custom tags, prompt injection controls and UI settings."
+    "minimum_client_version": "1.18.0",
+    "generate_interceptor": "MoreReasoning_generateInterceptor",
+    "description": "Expand SillyTavern's reasoning system with multiple independent custom reasoning parsers, prompt controls, streaming extraction, and UI settings."
 }
